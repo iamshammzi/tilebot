@@ -7,14 +7,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project
+      - name: Unzip and patch project
         run: |
           if [ -f TileBot.zip ]; then
             unzip -q -o TileBot.zip
           fi
+          # 1. Enable AndroidX & memory headroom
           echo "android.useAndroidX=true" >> TileBot/gradle.properties
           echo "org.gradle.jvmargs=-Xmx2048m" >> TileBot/gradle.properties
+          
+          # 2. Fix onStart lifecycle override
           sed -i 's/onStart()/startBot()/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
+          
+          # 3. Kill the screen lag: 4 buffers + quarter downscale
+          sed -i 's/const val SCALE = 2/const val SCALE = 4/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
+          sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
+          
+          # 4. Fix slider detection: widen lookahead line to 38%
+          sed -i 's/var lookaheadFrac = 0.52f/var lookaheadFrac = 0.38f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -29,4 +39,3 @@ jobs:
         with:
           name: TileBot-apk
           path: TileBot/app/build/outputs/apk/debug/app-debug.apk
-          
