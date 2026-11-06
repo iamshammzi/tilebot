@@ -12,6 +12,8 @@ jobs:
           if [ -f TileBot.zip ]; then
             unzip -q -o TileBot.zip
           fi
+          echo "android.useAndroidX=true" >> TileBot/gradle.properties
+          echo "org.gradle.jvmargs=-Xmx2048m" >> TileBot/gradle.properties
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -26,4 +28,3 @@ jobs:
         with:
           name: TileBot-apk
           path: TileBot/app/build/outputs/apk/debug/app-debug.apk
-          
