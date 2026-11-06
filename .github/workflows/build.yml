@@ -15,7 +15,7 @@ jobs:
           echo "android.useAndroidX=true" >> TileBot/gradle.properties
           echo "org.gradle.jvmargs=-Xmx2048m" >> TileBot/gradle.properties
 
-          # 1. Config: Restore high sensitivity & fast timing
+          # 1. Config.kt
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/Config.kt
           package com.example.tilebot
 
@@ -26,20 +26,18 @@ jobs:
               val laneFractions = floatArrayOf(0.125f, 0.375f, 0.625f, 0.875f)
 
               @Volatile var triggerFrac = 0.65f
-              @Volatile var lookaheadFrac = 0.40f
-              @Volatile var redThreshold = 90
+              @Volatile var darkThreshold = 95
               @Volatile var isPaused = true
 
-              const val TAP_DURATION_MS = 10L
-              const val HOLD_STEP_MS = 25L
-              const val MIN_RETRIGGER_MS = 20L
+              const val TAP_MS = 12L
+              const val CHUNK_MS = 30L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
           }
           EOF
 
-          # 2. TileDetector: Simple, high-speed detection (restores 100k performance)
+          # 2. TileDetector.kt - True run-length detector (from the 100k engine)
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -47,14 +45,14 @@ jobs:
           import android.os.SystemClock
 
           class TileDetector {
-              private enum class LaneState { IDLE, HOLDING, COOLING }
+              private enum class S { IDLE, TAPPED, HOLD }
 
-              private val states = Array(Config.LANES) { LaneState.IDLE }
-              private val lastActionTime = LongArray(Config.LANES)
-              private val holdStartTime = LongArray(Config.LANES)
+              private val state = Array(Config.LANES) { S.IDLE }
+              private val t0 = LongArray(Config.LANES)
+              private val holdMiss = IntArray(Config.LANES)
 
               fun resetAll() {
-                  for (i in 0 until Config.LANES) states[i] = LaneState.IDLE
+                  for (i in 0 until Config.LANES) state[i] = S.IDLE
               }
 
               fun process(img: Image) {
@@ -72,50 +70,70 @@ jobs:
                   val w = img.width
                   val h = img.height
 
-                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(2, h - 2)
-                  val lookY = (h * Config.lookaheadFrac).toInt().coerceIn(2, h - 2)
-                  val checkReleaseY = (trigY - (h * 0.04f).toInt()).coerceIn(2, h - 2)
-                  val thr = Config.redThreshold
+                  val laneW = w / Config.LANES
+                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(4, h - 4)
+                  val thr = Config.darkThreshold
 
-                  fun isDark(cx: Int, cy: Int): Boolean {
-                      val o = cy * rs + cx * ps
+                  fun dark(x: Int, y: Int): Boolean {
+                      val o = y * rs + x * ps
                       if (o + 2 >= buf.limit()) return false
-                      val r = buf.get(o).toInt() and 0xFF
-                      return r < thr
+                      val r = buf.get(o).toInt() and 255
+                      val g = buf.get(o + 1).toInt() and 255
+                      val b = buf.get(o + 2).toInt() and 255
+                      return (r + g + b) / 3 < thr || r < 50
                   }
 
-                  for (lane in 0 until Config.LANES) {
-                      val cx = (w * Config.laneFractions[lane]).toInt()
-                      val atTrig = isDark(cx, trigY)
+                  fun laneDark(l: Int, y: Int): Boolean {
+                      val cx = (w * Config.laneFractions[l]).toInt()
+                      val d = (laneW / 8).coerceAtLeast(2)
+                      var c = 0
+                      if (dark(cx, y)) c++
+                      if (dark(cx - d, y)) c++
+                      if (dark(cx + d, y)) c++
+                      return c >= 2
+                  }
 
-                      when (states[lane]) {
-                          LaneState.IDLE -> {
-                              if (atTrig && (now - lastActionTime[lane] >= Config.MIN_RETRIGGER_MS)) {
-                                  if (isDark(cx, lookY)) {
-                                      states[lane] = LaneState.HOLDING
-                                      holdStartTime[lane] = now
-                                      lastActionTime[lane] = now
-                                      svc.press(lane)
-                                  } else {
-                                      states[lane] = LaneState.COOLING
-                                      lastActionTime[lane] = now
-                                      svc.tap(lane)
-                                  }
+                  // Measure how far up the tile stretches
+                  fun runLength(l: Int): Int {
+                      val cx = (w * Config.laneFractions[l]).toInt()
+                      var y = trigY
+                      var top = trigY
+                      var gap = 0
+                      while (y >= 0) {
+                          if (dark(cx, y)) { top = y; gap = 0 } else if (++gap >= 4) break
+                          y--
+                      }
+                      return trigY - top
+                  }
+
+                  val tileH = h / 4f
+                  for (l in 0 until Config.LANES) {
+                      val isDark = laneDark(l, trigY)
+                      when (state[l]) {
+                          S.IDLE -> if (isDark) {
+                              if (runLength(l) >= tileH * 1.15f) {
+                                  state[l] = S.HOLD
+                                  holdMiss[l] = 0
+                                  svc.press(l)
+                              } else {
+                                  state[l] = S.TAPPED
+                                  t0[l] = now
+                                  svc.tap(l)
                               }
                           }
-                          LaneState.HOLDING -> {
-                              // Release when the tile tail clears above the hit line (avoids hit spark trap)
-                              val tailCleared = !isDark(cx, checkReleaseY)
-                              val timeout = (now - holdStartTime[lane] > 2200L)
-                              if (tailCleared || timeout) {
-                                  svc.release(lane)
-                                  states[lane] = LaneState.COOLING
-                                  lastActionTime[lane] = now
+                          S.TAPPED -> {
+                              // Reset as soon as the black tile clears under the trigger line
+                              if (!isDark || (now - t0[l] >= 40L)) {
+                                  state[l] = S.IDLE
                               }
                           }
-                          LaneState.COOLING -> {
-                              if (!atTrig || (now - lastActionTime[lane] >= 35L)) {
-                                  states[lane] = LaneState.IDLE
+                          S.HOLD -> {
+                              val above = laneDark(l, trigY - 2) || laneDark(l, trigY - 4)
+                              if (above) {
+                                  holdMiss[l] = 0
+                              } else if (++holdMiss[l] >= 2) {
+                                  svc.release(l)
+                                  state[l] = S.IDLE
                               }
                           }
                       }
@@ -124,7 +142,7 @@ jobs:
           }
           EOF
 
-          # 3. TapService: Rock-solid stroke loop + Floating button
+          # 3. TapService.kt - Continuous stroke engine with floating pill button
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -159,7 +177,7 @@ jobs:
               private val mainHandler = Handler(Looper.getMainLooper())
               private val queue = ConcurrentLinkedQueue<Action>()
               private val activeHolds = HashMap<Int, HoldState>()
-              private val keepHolding = AtomicInteger(0)
+              private val keep = AtomicInteger(0)
               private var inFlight = false
 
               private var wm: WindowManager? = null
@@ -262,28 +280,28 @@ jobs:
               fun tap(lane: Int) {
                   if (Config.isPaused) return
                   queue.add(Action(lane, false))
-                  mainHandler.post { processQueue() }
+                  mainHandler.post { pump() }
               }
 
               fun press(lane: Int) {
                   if (Config.isPaused) return
-                  keepHolding.updateAndGet { it or (1 shl lane) }
+                  keep.updateAndGet { it or (1 shl lane) }
                   queue.add(Action(lane, true))
-                  mainHandler.post { processQueue() }
+                  mainHandler.post { pump() }
               }
 
               fun release(lane: Int) {
-                  keepHolding.updateAndGet { it and (1 shl lane).inv() }
-                  mainHandler.post { processQueue() }
+                  keep.updateAndGet { it and (1 shl lane).inv() }
+                  mainHandler.post { pump() }
               }
 
               fun releaseAll() {
-                  keepHolding.set(0)
+                  keep.set(0)
                   queue.clear()
-                  mainHandler.post { processQueue() }
+                  mainHandler.post { pump() }
               }
 
-              private fun processQueue() {
+              private fun pump() {
                   if (inFlight) return
                   if (Config.isPaused) {
                       activeHolds.clear()
@@ -291,77 +309,58 @@ jobs:
                   }
 
                   val strokes = ArrayList<StrokeDescription>()
-                  val lanesHandled = HashSet<Int>()
-                  val mask = keepHolding.get()
+                  val used = HashSet<Int>()
 
-                  // 1. Continue active holds or cleanly complete released ones
-                  val iterator = activeHolds.entries.iterator()
-                  while (iterator.hasNext()) {
-                      val entry = iterator.next()
-                      val lane = entry.key
-                      val state = entry.value
-                      val continueHold = (mask and (1 shl lane)) != 0
-
-                      val path = Path().apply { moveTo(state.x, state.y) }
-                      state.stroke = state.stroke.continueStroke(
-                          path, 0L, if (continueHold) Config.HOLD_STEP_MS else 1L, continueHold
+                  val it = activeHolds.entries.iterator()
+                  while (it.hasNext()) {
+                      val e = it.next()
+                      val h = e.value
+                      val k = (keep.get() and (1 shl e.key)) != 0
+                      h.stroke = h.stroke.continueStroke(
+                          Path().apply { moveTo(h.x, h.y) }, 0L, if (k) Config.CHUNK_MS else 1L, k
                       )
-                      strokes.add(state.stroke)
-                      lanesHandled.add(lane)
-
-                      if (!continueHold) {
-                          iterator.remove()
-                      }
+                      strokes.add(h.stroke)
+                      used.add(e.key)
+                      if (!k) it.remove()
                   }
 
-                  // 2. Queue new actions
                   while (true) {
-                      val action = queue.poll() ?: break
-                      if (action.lane in lanesHandled) continue
-
-                      val x = Config.screenW * Config.laneFractions[action.lane]
+                      val a = queue.poll() ?: break
+                      if (a.lane in used) continue
+                      val x = Config.screenW * Config.laneFractions[a.lane]
                       val y = Config.screenH * Config.triggerFrac
                       val path = Path().apply { moveTo(x, y) }
-
-                      if (action.hold) {
-                          val stroke = StrokeDescription(path, 0L, Config.HOLD_STEP_MS, true)
-                          activeHolds[action.lane] = HoldState(stroke, x, y)
-                          strokes.add(stroke)
+                      if (a.hold) {
+                          val s = StrokeDescription(path, 0L, Config.CHUNK_MS, true)
+                          activeHolds[a.lane] = HoldState(s, x, y)
+                          strokes.add(s)
                       } else {
-                          strokes.add(StrokeDescription(path, 0L, Config.TAP_DURATION_MS, false))
+                          strokes.add(StrokeDescription(path, 0L, Config.TAP_MS, false))
                       }
-                      lanesHandled.add(action.lane)
+                      used.add(a.lane)
                   }
 
                   if (strokes.isEmpty()) return
 
-                  val gesture = GestureDescription.Builder().apply {
+                  val g = GestureDescription.Builder().apply {
                       strokes.forEach { addStroke(it) }
                   }.build()
 
                   inFlight = true
-                  val sent = dispatchGesture(gesture, object : GestureResultCallback() {
-                      override fun onCompleted(gestureDescription: GestureDescription?) {
-                          inFlight = false
-                          processQueue()
-                      }
-
-                      override fun onCancelled(gestureDescription: GestureDescription?) {
-                          inFlight = false
-                          activeHolds.clear()
-                          processQueue()
-                      }
+                  val sent = dispatchGesture(g, object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) { inFlight = false; pump() }
+                      override fun onCancelled(d: GestureDescription?) { inFlight = false; activeHolds.clear(); pump() }
                   }, null)
 
                   if (!sent) {
                       inFlight = false
-                      processQueue()
+                      mainHandler.postDelayed({ pump() }, 10L)
                   }
               }
           }
           EOF
 
-          # 4. MainActivity with startBot() lifecycle fix
+          # 4. MainActivity.kt with startBot() lifecycle fix
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
           package com.example.tilebot
 
@@ -392,7 +391,7 @@ jobs:
                       startForegroundService(
                           Intent(this, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", data)
                       )
-                      Toast.makeText(this, "Armed. Open Piano Tiles and tap the floating button when ready!", Toast.LENGTH_LONG).show()
+                      Toast.makeText(this, "Capture started! Open the game and tap the floating button.", Toast.LENGTH_LONG).show()
                       moveTaskToBack(true)
                   }
               }
@@ -402,15 +401,15 @@ jobs:
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
-                  Config.redThreshold = prefs.getInt("red", 90)
+                  Config.darkThreshold = prefs.getInt("dark", 95)
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
 
                   root.addView(TextView(this).apply {
-                      text = "1. Enable TileBot Accessibility Service (floating button appears).\n" +
+                      text = "1. Enable TileBot Accessibility Service.\n" +
                           "2. Tap Start Capture and choose \"Entire screen\".\n" +
-                          "3. Open the game and tap BOT: PAUSED -> BOT: ON to play!"
+                          "3. Open Piano Tiles and tap the floating button (BOT: PAUSED -> BOT: ON) to play!"
                   })
                   root.addView(Button(this).apply {
                       text = "1. Open accessibility settings"
@@ -429,8 +428,8 @@ jobs:
                   slider(root, "Trigger line (% of height)", 40, 85, (Config.triggerFrac * 100).toInt()) {
                       Config.triggerFrac = it / 100f; prefs.edit().putInt("trig", it).apply()
                   }
-                  slider(root, "Dark threshold (Default 90)", 40, 140, Config.redThreshold) {
-                      Config.redThreshold = it; prefs.edit().putInt("red", it).apply()
+                  slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
+                      Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
                   }
                   setContentView(root)
               }
@@ -467,7 +466,7 @@ jobs:
           }
           EOF
 
-          # 5. Ensure 4 buffers in CaptureService
+          # 5. CaptureService buffer count
           sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
       - uses: actions/setup-java@v4
         with:
