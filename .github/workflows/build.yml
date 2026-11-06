@@ -29,15 +29,15 @@ jobs:
               @Volatile var darkThreshold = 95
               @Volatile var isPaused = true
 
-              const val TAP_MS = 12L
-              const val CHUNK_MS = 30L
+              const val TAP_MS = 10L
+              const val HOLD_STEP_MS = 25L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
           }
           EOF
 
-          # 2. TileDetector.kt - True run-length detector (from the 100k engine)
+          # 2. TileDetector.kt - Restores proven 100k run-length detection with clean tail-tracking
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -93,7 +93,6 @@ jobs:
                       return c >= 2
                   }
 
-                  // Measure how far up the tile stretches
                   fun runLength(l: Int): Int {
                       val cx = (w * Config.laneFractions[l]).toInt()
                       var y = trigY
@@ -122,8 +121,7 @@ jobs:
                               }
                           }
                           S.TAPPED -> {
-                              // Reset as soon as the black tile clears under the trigger line
-                              if (!isDark || (now - t0[l] >= 40L)) {
+                              if (!isDark || (now - t0[l] >= 35L)) {
                                   state[l] = S.IDLE
                               }
                           }
@@ -142,7 +140,7 @@ jobs:
           }
           EOF
 
-          # 3. TapService.kt - Continuous stroke engine with floating pill button
+          # 3. TapService.kt - Non-conflicting natural stroke termination & fail-safe recovery
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -311,19 +309,25 @@ jobs:
                   val strokes = ArrayList<StrokeDescription>()
                   val used = HashSet<Int>()
 
+                  // 1. Continue active holds. If released, simply omit it: Android auto-lifts the finger naturally!
                   val it = activeHolds.entries.iterator()
                   while (it.hasNext()) {
                       val e = it.next()
                       val h = e.value
                       val k = (keep.get() and (1 shl e.key)) != 0
-                      h.stroke = h.stroke.continueStroke(
-                          Path().apply { moveTo(h.x, h.y) }, 0L, if (k) Config.CHUNK_MS else 1L, k
-                      )
-                      strokes.add(h.stroke)
-                      used.add(e.key)
-                      if (!k) it.remove()
+                      if (k) {
+                          h.stroke = h.stroke.continueStroke(
+                              Path().apply { moveTo(h.x, h.y) }, 0L, Config.HOLD_STEP_MS, true
+                          )
+                          strokes.add(h.stroke)
+                          used.add(e.key)
+                      } else {
+                          // Removed from active holds; Android automatically executes ACTION_POINTER_UP
+                          it.remove()
+                      }
                   }
 
+                  // 2. Queue new taps and newly initiated holds
                   while (true) {
                       val a = queue.poll() ?: break
                       if (a.lane in used) continue
@@ -331,7 +335,7 @@ jobs:
                       val y = Config.screenH * Config.triggerFrac
                       val path = Path().apply { moveTo(x, y) }
                       if (a.hold) {
-                          val s = StrokeDescription(path, 0L, Config.CHUNK_MS, true)
+                          val s = StrokeDescription(path, 0L, Config.HOLD_STEP_MS, true)
                           activeHolds[a.lane] = HoldState(s, x, y)
                           strokes.add(s)
                       } else {
@@ -348,19 +352,27 @@ jobs:
 
                   inFlight = true
                   val sent = dispatchGesture(g, object : GestureResultCallback() {
-                      override fun onCompleted(d: GestureDescription?) { inFlight = false; pump() }
-                      override fun onCancelled(d: GestureDescription?) { inFlight = false; activeHolds.clear(); pump() }
+                      override fun onCompleted(d: GestureDescription?) {
+                          inFlight = false
+                          pump()
+                      }
+                      override fun onCancelled(d: GestureDescription?) {
+                          inFlight = false
+                          activeHolds.clear()
+                          pump()
+                      }
                   }, null)
 
                   if (!sent) {
                       inFlight = false
+                      activeHolds.clear() // Prevent stale continueStroke loops
                       mainHandler.postDelayed({ pump() }, 10L)
                   }
               }
           }
           EOF
 
-          # 4. MainActivity.kt with startBot() lifecycle fix
+          # 4. MainActivity.kt
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
           package com.example.tilebot
 
@@ -391,7 +403,7 @@ jobs:
                       startForegroundService(
                           Intent(this, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", data)
                       )
-                      Toast.makeText(this, "Capture started! Open the game and tap the floating button.", Toast.LENGTH_LONG).show()
+                      Toast.makeText(this, "Armed. Open Piano Tiles and tap the floating button when ready!", Toast.LENGTH_LONG).show()
                       moveTaskToBack(true)
                   }
               }
@@ -409,7 +421,7 @@ jobs:
                   root.addView(TextView(this).apply {
                       text = "1. Enable TileBot Accessibility Service.\n" +
                           "2. Tap Start Capture and choose \"Entire screen\".\n" +
-                          "3. Open Piano Tiles and tap the floating button (BOT: PAUSED -> BOT: ON) to play!"
+                          "3. Open the game and tap BOT: PAUSED -> BOT: ON to play!"
                   })
                   root.addView(Button(this).apply {
                       text = "1. Open accessibility settings"
