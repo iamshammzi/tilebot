@@ -39,7 +39,7 @@ jobs:
           }
           EOF
 
-          # 2. Write TileDetector.kt with 3-point horizontal sampling & early slider release before bottom edge
+          # 2. Write TileDetector.kt (3-point horizontal sampling + clean slider feed check)
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -85,16 +85,13 @@ jobs:
                       val r = buf.get(o).toInt() and 0xFF
                       val g = buf.get(o + 1).toInt() and 0xFF
                       val b = buf.get(o + 2).toInt() and 0xFF
-                      // Untapped black/navy tile head OR royal blue slider body (ignores +20 text & purple fade trails)
                       return r < Config.redThreshold && (g < 105 || (g <= 178 && b > 185))
                   }
 
-                  // 3-point horizontal check across the lane so "+20" text never blocks detection
                   fun isStrikeTarget(cx: Int, cy: Int): Boolean {
                       return isPixelTarget(cx, cy) || isPixelTarget(cx - dx, cy) || isPixelTarget(cx + dx, cy)
                   }
 
-                  // Checks if unheld Royal Blue slider body is still feeding into the trigger zone
                   fun isSliderStillFeeding(cx: Int): Boolean {
                       fun checkBlueOrDark(x: Int, y: Int): Boolean {
                           val o = y * rs + x * ps
@@ -104,7 +101,6 @@ jobs:
                           val b = buf.get(o + 2).toInt() and 0xFF
                           return r < 48 && (b > 185 || g < 90)
                       }
-                      // Hold only while aboveY still has slider body, so we release cleanly when the tail arrives
                       return checkBlueOrDark(cx, aboveY) || checkBlueOrDark(cx - dx, aboveY) || checkBlueOrDark(cx + dx, aboveY)
                   }
 
@@ -148,7 +144,7 @@ jobs:
           }
           EOF
 
-          # 3. Write TapService.kt with Self-Healing Hold Sync (never drops a slider on multi-lane transitions)
+          # 3. Write TapService.kt (Floating button + Self-healing hold sync)
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -316,7 +312,6 @@ jobs:
                   val lanesHandled = HashSet<Int>()
                   val mask = keepHoldingMask.get()
 
-                  // 1. Continue existing holds or cleanly finish released ones
                   val iterator = activeHolds.entries.iterator()
                   while (iterator.hasNext()) {
                       val entry = iterator.next()
@@ -330,7 +325,6 @@ jobs:
                           strokes.add(state.stroke)
                           lanesHandled.add(lane)
                       } else {
-                          // End stroke cleanly with a 1ms tail and remove from activeHolds
                           val endStroke = state.stroke.continueStroke(path, 0L, 1L, false)
                           strokes.add(endStroke)
                           lanesHandled.add(lane)
@@ -338,7 +332,6 @@ jobs:
                       }
                   }
 
-                  // 2. Self-healing hold start: any lane in keepHoldingMask not yet in activeHolds starts immediately
                   for (lane in 0 until Config.LANES) {
                       if ((mask and (1 shl lane)) != 0 && lane !in lanesHandled) {
                           val x = Config.screenW * Config.laneFractions[lane]
@@ -351,7 +344,6 @@ jobs:
                       }
                   }
 
-                  // 3. Dispatch queued single taps in free lanes
                   while (true) {
                       val lane = tapQueue.poll() ?: break
                       if (lane in lanesHandled) continue
@@ -378,7 +370,6 @@ jobs:
                       override fun onCancelled(gestureDescription: GestureDescription?) {
                           inFlight = false
                           activeHolds.clear()
-                          // Immediately re-pump so any active bit in keepHoldingMask restarts its hold!
                           processQueue()
                       }
                   }, null)
@@ -392,9 +383,114 @@ jobs:
           }
           EOF
 
-          # 4. Update default slider values in MainActivity.kt
-          sed -i 's/prefs.getInt("trig", 66)/prefs.getInt("trig", 64)/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
-          sed -i 's/prefs.getInt("red", 48)/prefs.getInt("red", 52)/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
+          # 4. Write complete MainActivity.kt (uses startBot() to avoid ComponentActivity.onStart() conflict)
+          cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
+          package com.example.tilebot
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+
+          class MainActivity : ComponentActivity() {
+
+              private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
+
+              private val projLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  val data = r.data
+                  if (r.resultCode == RESULT_OK && data != null) {
+                      Config.isPaused = true
+                      TapService.instance?.refreshButton()
+                      startForegroundService(
+                          Intent(this, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", data)
+                      )
+                      Toast.makeText(this, "Capture started! Open the game and tap the floating button to start.", Toast.LENGTH_LONG).show()
+                      moveTaskToBack(true)
+                  }
+              }
+
+              private val notifLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { launchCapture() }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Config.triggerFrac = prefs.getInt("trig", 64) / 100f
+                  Config.redThreshold = prefs.getInt("red", 52)
+
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
+
+                  root.addView(TextView(this).apply {
+                      text = "1. Enable TileBot Accessibility Service (a floating button will appear).\n" +
+                          "2. Tap Start Capture and choose \"Entire screen\".\n" +
+                          "3. Open Piano Tiles and tap the floating button (BOT: PAUSED -> BOT: ON) when ready to play!"
+                  })
+                  root.addView(Button(this).apply {
+                      text = "1. Open accessibility settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  root.addView(Button(this).apply { text = "2. Start Capture"; setOnClickListener { startBot() } })
+                  root.addView(Button(this).apply {
+                      text = "Stop Capture"
+                      setOnClickListener {
+                          Config.isPaused = true
+                          TapService.instance?.refreshButton()
+                          stopService(Intent(this@MainActivity, CaptureService::class.java))
+                      }
+                  })
+
+                  slider(root, "Trigger line (% of height)", 40, 85, (Config.triggerFrac * 100).toInt()) {
+                      Config.triggerFrac = it / 100f; prefs.edit().putInt("trig", it).apply()
+                  }
+                  slider(root, "Red color threshold (Default 52)", 25, 95, Config.redThreshold) {
+                      Config.redThreshold = it; prefs.edit().putInt("red", it).apply()
+                  }
+                  setContentView(root)
+              }
+
+              private fun startBot() {
+                  if (TapService.instance == null) {
+                      Toast.makeText(this, "Enable the accessibility service first", Toast.LENGTH_LONG).show(); return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) else launchCapture()
+              }
+
+              private fun launchCapture() {
+                  val mgr = getSystemService(MediaProjectionManager::class.java)
+                  projLauncher.launch(mgr.createScreenCaptureIntent())
+              }
+
+              private fun slider(root: LinearLayout, label: String, min: Int, max: Int, init: Int, on: (Int) -> Unit) {
+                  val tv = TextView(this).apply { text = "$label: $init"; setPadding(0, 32, 0, 0) }
+                  val sb = SeekBar(this).apply {
+                      this.max = max - min
+                      progress = init - min
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                              tv.text = "$label: ${p + min}"; on(p + min)
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  root.addView(tv); root.addView(sb)
+              }
+          }
+          EOF
+
+          # 5. Ensure 4 buffers in CaptureService.kt
+          sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
