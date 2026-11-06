@@ -19,12 +19,18 @@ jobs:
           # 2. Fix onStart lifecycle override
           sed -i 's/onStart()/startBot()/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
           
-          # 3. Kill the screen lag: 4 buffers + quarter downscale
+          # 3. Optimize capture buffer & downscale
           sed -i 's/const val SCALE = 2/const val SCALE = 4/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
           sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
           
-          # 4. Fix slider detection: widen lookahead line to 38%
-          sed -i 's/var lookaheadFrac = 0.52f/var lookaheadFrac = 0.38f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
+          # 4. Set optimal trigger and lookahead defaults
+          sed -i 's/var triggerFrac = 0.70f/var triggerFrac = 0.74f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
+          sed -i 's/var lookaheadFrac = 0.52f/var lookaheadFrac = 0.42f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
+          sed -i 's/prefs.getInt("trig", 70)/prefs.getInt("trig", 74)/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
+          
+          # 5. Fix gesture lockup watchdog: if dispatch returns false, clear inFlight immediately
+          sed -i 's/inFlight = dispatchGesture(gesture/val sent = dispatchGesture(gesture/g' TileBot/app/src/main/java/com/example/tilebot/TapService.kt
+          sed -i 's/null)/null); if (!sent) { inFlight = false; processQueue() } else { inFlight = true }/g' TileBot/app/src/main/java/com/example/tilebot/TapService.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
