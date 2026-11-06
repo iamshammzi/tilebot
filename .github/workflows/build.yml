@@ -14,6 +14,7 @@ jobs:
           fi
           echo "android.useAndroidX=true" >> TileBot/gradle.properties
           echo "org.gradle.jvmargs=-Xmx2048m" >> TileBot/gradle.properties
+          sed -i 's/onStart()/startBot()/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -28,3 +29,4 @@ jobs:
         with:
           name: TileBot-apk
           path: TileBot/app/build/outputs/apk/debug/app-debug.apk
+          
