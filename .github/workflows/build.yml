@@ -19,26 +19,204 @@ jobs:
           # 2. Fix onStart lifecycle override
           sed -i 's/onStart()/startBot()/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
           
-          # 3. Fast capture settings: 4 buffers + 1/4 downscale
+          # 3. High-performance capture configuration
           sed -i 's/const val SCALE = 2/const val SCALE = 4/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
           sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
-          
-          # 4. Trigger height optimized for high-speed post-slider tiles (65%)
-          sed -i 's/var triggerFrac = 0.70f/var triggerFrac = 0.65f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
-          sed -i 's/var lookaheadFrac = 0.52f/var lookaheadFrac = 0.38f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
-          sed -i 's/prefs.getInt("trig", 70)/prefs.getInt("trig", 65)/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
-          
-          # 5. Remove post-hold cooling delay (react immediately to tiles after sliders)
-          sed -i 's/now - lastActionTime\[lane\] >= 60L/now - lastActionTime\[lane\] >= 15L/g' TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
-          
-          # 6. Ultra-fast hold chunk (20ms instead of 40/60ms) so hold never starves rapid taps
-          sed -i 's/const val HOLD_STEP_MS = 60L/const val HOLD_STEP_MS = 20L/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
-          sed -i 's/const val HOLD_STEP_MS = 40L/const val HOLD_STEP_MS = 20L/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
-          sed -i 's/const val TAP_DURATION_MS = 12L/const val TAP_DURATION_MS = 8L/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
-          
-          # 7. Watchdog: never freeze inFlight if gesture finishes or drops
-          sed -i 's/inFlight = dispatchGesture(gesture/val sent = dispatchGesture(gesture/g' TileBot/app/src/main/java/com/example/tilebot/TapService.kt
-          sed -i 's/null)/null); if (!sent) { inFlight = false; processQueue() } else { inFlight = true }/g' TileBot/app/src/main/java/com/example/tilebot/TapService.kt
+          sed -i 's/var triggerFrac = 0.70f/var triggerFrac = 0.68f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
+          sed -i 's/var lookaheadFrac = 0.52f/var lookaheadFrac = 0.40f/g' TileBot/app/src/main/java/com/example/tilebot/Config.kt
+          sed -i 's/prefs.getInt("trig", 70)/prefs.getInt("trig", 68)/g' TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
+
+          # 4. Overwrite TapService.kt with non-blocking, multi-touch gesture engine
+          cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
+          package com.example.tilebot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.accessibilityservice.GestureDescription.StrokeDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+          import java.util.concurrent.ConcurrentLinkedQueue
+          import java.util.concurrent.atomic.AtomicInteger
+
+          class TapService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var instance: TapService? = null
+                  private const val HOLD_CHUNK_MS = 35L
+                  private const val TAP_MS = 10L
+              }
+
+              private class Action(val lane: Int, val isHold: Boolean)
+
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private val actionQueue = ConcurrentLinkedQueue<Action>()
+              private val keepHolding = AtomicInteger(0)
+              private var inFlight = false
+
+              override fun onServiceConnected() { instance = this }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              fun tap(lane: Int) {
+                  actionQueue.add(Action(lane, false))
+                  mainHandler.post { pump() }
+              }
+
+              fun press(lane: Int) {
+                  keepHolding.updateAndGet { it or (1 shl lane) }
+                  actionQueue.add(Action(lane, true))
+                  mainHandler.post { pump() }
+              }
+
+              fun release(lane: Int) {
+                  keepHolding.updateAndGet { it and (1 shl lane).inv() }
+                  mainHandler.post { pump() }
+              }
+
+              fun releaseAll() {
+                  keepHolding.set(0)
+                  mainHandler.post { pump() }
+              }
+
+              private fun pump() {
+                  if (inFlight) return
+
+                  val builder = GestureDescription.Builder()
+                  var strokesAdded = 0
+                  val currentMask = keepHolding.get()
+
+                  // 1. Dispatch active holds (each as an independent short pulse, never locking the queue)
+                  for (lane in 0 until Config.LANES) {
+                      if ((currentMask and (1 shl lane)) != 0) {
+                          val x = Config.screenW * Config.laneFractions[lane]
+                          val y = Config.screenH * Config.triggerFrac
+                          val path = Path().apply { moveTo(x, y) }
+                          builder.addStroke(StrokeDescription(path, 0, HOLD_CHUNK_MS, false))
+                          strokesAdded++
+                      }
+                  }
+
+                  // 2. Dispatch queued taps
+                  while (true) {
+                      val action = actionQueue.poll() ?: break
+                      if ((currentMask and (1 shl action.lane)) != 0) continue // Already covered by hold
+                      val x = Config.screenW * Config.laneFractions[action.lane]
+                      val y = Config.screenH * Config.triggerFrac
+                      val path = Path().apply { moveTo(x, y) }
+                      builder.addStroke(StrokeDescription(path, 0, if (action.isHold) HOLD_CHUNK_MS else TAP_MS, false))
+                      strokesAdded++
+                      if (strokesAdded >= 8) break
+                  }
+
+                  if (strokesAdded == 0) return
+
+                  inFlight = true
+                  val gesture = builder.build()
+                  val sent = dispatchGesture(gesture, object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) {
+                          inFlight = false
+                          pump()
+                      }
+                      override fun onCancelled(d: GestureDescription?) {
+                          inFlight = false
+                          pump()
+                      }
+                  }, null)
+
+                  if (!sent) {
+                      inFlight = false
+                      mainHandler.postDelayed({ pump() }, 10)
+                  }
+              }
+          }
+          EOF
+
+          # 5. Overwrite TileDetector.kt with robust tail & multi-point release logic
+          cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
+          package com.example.tilebot
+
+          import android.media.Image
+          import android.os.SystemClock
+
+          class TileDetector {
+              private enum class LaneState { IDLE, HOLDING, COOLING }
+
+              private val states = Array(Config.LANES) { LaneState.IDLE }
+              private val lastActionTime = LongArray(Config.LANES)
+              private val holdStartTime = LongArray(Config.LANES)
+              private val armedAt = SystemClock.uptimeMillis() + 3000L
+
+              fun process(img: Image) {
+                  val now = SystemClock.uptimeMillis()
+                  if (now < armedAt) return
+                  val svc = TapService.instance ?: return
+
+                  val plane = img.planes[0]
+                  val buf = plane.buffer
+                  val rs = plane.rowStride
+                  val ps = plane.pixelStride
+                  val w = img.width
+                  val h = img.height
+
+                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(0, h - 1)
+                  val lookY = (h * Config.lookaheadFrac).toInt().coerceIn(0, h - 1)
+                  val aboveY = (trigY - 8).coerceIn(0, h - 1)
+
+                  fun isTile(cx: Int, cy: Int): Boolean {
+                      val offset = cy * rs + cx * ps
+                      if (offset + 2 >= buf.limit()) return false
+                      val r = buf.get(offset).toInt() and 0xFF
+                      return r < Config.redThreshold
+                  }
+
+                  for (lane in 0 until Config.LANES) {
+                      val cx = (w * Config.laneFractions[lane]).toInt()
+                      val tileAtTrigger = isTile(cx, trigY)
+                      val tileAbove = isTile(cx, aboveY)
+
+                      when (states[lane]) {
+                          LaneState.IDLE -> {
+                              if (tileAtTrigger && (now - lastActionTime[lane] >= Config.MIN_RETRIGGER_MS)) {
+                                  val tileAtLookahead = isTile(cx, lookY)
+                                  if (tileAtLookahead) {
+                                      states[lane] = LaneState.HOLDING
+                                      holdStartTime[lane] = now
+                                      lastActionTime[lane] = now
+                                      svc.press(lane)
+                                  } else {
+                                      states[lane] = LaneState.COOLING
+                                      lastActionTime[lane] = now
+                                      svc.tap(lane)
+                                  }
+                              }
+                          }
+                          LaneState.HOLDING -> {
+                              // Slider tail passed or watchdog safety cap (max 2.2s per slider)
+                              val tailCleared = !tileAtTrigger && !tileAbove
+                              val timeout = (now - holdStartTime[lane] > 2200L)
+                              if (tailCleared || timeout) {
+                                  svc.release(lane)
+                                  states[lane] = LaneState.COOLING
+                                  lastActionTime[lane] = now
+                              }
+                          }
+                          LaneState.COOLING -> {
+                              if (!tileAtTrigger || (now - lastActionTime[lane] >= 20L)) {
+                                  states[lane] = LaneState.IDLE
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
