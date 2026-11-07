@@ -35,7 +35,7 @@ jobs:
               @Volatile var holdDurationMs = 20000L
               @Volatile var isPaused = true
 
-              const val TAP_MS = 9L
+              const val TAP_MS = 16L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Same-column gap detection + chord lookahead + 20s preemptible holds
+          # 3. TileDetector.kt - Detects both light gaps AND flush Blue->Black same-column boundaries
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -86,11 +86,13 @@ jobs:
               private val state = Array(Config.LANES) { S.IDLE }
               private val t0 = LongArray(Config.LANES)
               private val cooldownUntil = LongArray(Config.LANES)
+              private val seenBlueInHold = BooleanArray(Config.LANES)
 
               fun resetAll() {
                   for (i in 0 until Config.LANES) {
                       state[i] = S.IDLE
                       cooldownUntil[i] = 0L
+                      seenBlueInHold[i] = false
                   }
               }
 
@@ -119,7 +121,9 @@ jobs:
                       val r = buf.get(o).toInt() and 255
                       val g = buf.get(o + 1).toInt() and 255
                       val b = buf.get(o + 2).toInt() and 255
-                      return (r + g + b) / 3 < thr || r < 50
+                      // Exclude faded translucent purple tiles (already-tapped black tiles have R>75, B>125)
+                      if (r > 75 && b > 125) return false
+                      return (r + g + b) / 3 < thr || r < 48
                   }
 
                   fun laneDark(l: Int, y: Int): Boolean {
@@ -130,6 +134,44 @@ jobs:
                       if (dark(cx - d, y)) c++
                       if (dark(cx + d, y)) c++
                       return c >= 2
+                  }
+
+                  // Checks if the row y in lane l is inside the bright blue / cyan body of a slider (B > 130, B - R > 55)
+                  fun laneIsSliderBlue(l: Int, y: Int): Boolean {
+                      val cy = y.coerceIn(0, h - 1)
+                      val cx = (w * Config.laneFractions[l]).toInt()
+                      val d = (laneW / 6).coerceAtLeast(3)
+                      var blueCount = 0
+                      val xs = intArrayOf(cx - d, cx, cx + d)
+                      for (px in xs) {
+                          val o = cy * rs + px * ps
+                          if (o + 2 < buf.limit()) {
+                              val r = buf.get(o).toInt() and 255
+                              val b = buf.get(o + 2).toInt() and 255
+                              if (b > 130 && (b - r) > 55) blueCount++
+                          }
+                      }
+                      return blueCount >= 2
+                  }
+
+                  // Checks if the row y in lane l is the pitch-black bottom of a new tile (R < 45, G < 58, B < 88)
+                  // Every black tap tile AND the bottom start-circle area of every new blue slider is pitch black!
+                  fun laneIsPitchBlack(l: Int, y: Int): Boolean {
+                      val cy = y.coerceIn(0, h - 1)
+                      val cx = (w * Config.laneFractions[l]).toInt()
+                      val d = (laneW / 6).coerceAtLeast(3)
+                      var blackCount = 0
+                      val xs = intArrayOf(cx - d, cx, cx + d)
+                      for (px in xs) {
+                          val o = cy * rs + px * ps
+                          if (o + 2 < buf.limit()) {
+                              val r = buf.get(o).toInt() and 255
+                              val g = buf.get(o + 1).toInt() and 255
+                              val b = buf.get(o + 2).toInt() and 255
+                              if (r < 45 && g < 58 && b < 88) blackCount++
+                          }
+                      }
+                      return blackCount >= 2
                   }
 
                   fun hasLightGapAtTrigger(l: Int): Boolean {
@@ -146,28 +188,24 @@ jobs:
 
                   fun isBlueSliderBody(l: Int, startY: Int, run: Int): Boolean {
                       if (run < 95) return false
-                      val cx = (w * Config.laneFractions[l]).toInt()
-                      val d = (laneW / 6).coerceAtLeast(3)
                       val sampleY = (startY - (run * 0.55f).toInt()).coerceIn(4, h - 4)
-                      var blueHits = 0
-                      val xs = intArrayOf(cx - d, cx, cx + d)
-                      for (px in xs) {
-                          val o = sampleY * rs + px * ps
-                          if (o + 2 < buf.limit()) {
-                              val r = buf.get(o).toInt() and 255
-                              val b = buf.get(o + 2).toInt() and 255
-                              if (b > 90 && (b - r) > 38) blueHits++
-                          }
-                      }
-                      return blueHits >= 2
+                      return laneIsSliderBlue(l, sampleY)
                   }
 
+                  // Stops at either a 2px light gap OR a Blue->PitchBlack boundary so flush same-column tiles never merge
                   fun runLengthFrom(l: Int, startY: Int): Int {
                       var y = startY
                       var top = startY
                       var gap = 0
+                      var seenBlue = false
                       while (y >= 0) {
                           if (laneDark(l, y)) {
+                              if (laneIsSliderBlue(l, y)) {
+                                  seenBlue = true
+                              } else if (seenBlue && laneIsPitchBlack(l, y) && laneIsPitchBlack(l, y - 2)) {
+                                  // Reached the pitch-black bottom of a second tile stacked flush on top of this slider
+                                  break
+                              }
                               top = y
                               gap = 0
                           } else if (++gap >= 2) {
@@ -188,6 +226,7 @@ jobs:
                       if (run >= sliderRun || isBlueSliderBody(l, scanY, run)) {
                           state[l] = S.HOLD
                           t0[l] = now
+                          seenBlueInHold[l] = false
                           val holdMs = Config.holdDurationMs
                           FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${holdMs}ms)")
                           svc.enqueueHold(l, holdMs)
@@ -214,16 +253,31 @@ jobs:
                           S.TAPPED -> {
                               if (now - t0[l] >= 25L && hasLightGapAtTrigger(l)) {
                                   state[l] = S.IDLE
-                                  cooldownUntil[l] = now + 12L
-                              } else if (now - t0[l] >= 420L) {
+                                  cooldownUntil[l] = now + 10L
+                              } else if (now - t0[l] >= 320L) {
                                   state[l] = S.IDLE
                               }
                           }
                           S.HOLD -> {
-                              if (now - t0[l] >= 40L && hasLightGapAtTrigger(l)) {
-                                  FlightLog.log("DET", "L$l SLIDER CLEARED")
+                              if (!seenBlueInHold[l] && (laneIsSliderBlue(l, trigY) || laneIsSliderBlue(l, trigY - 4))) {
+                                  seenBlueInHold[l] = true
+                              }
+                              val lightCleared = now - t0[l] >= 40L && hasLightGapAtTrigger(l)
+                              // Flush same-column boundary: Slider #1's blue body just ended and Tile #2's pitch-black bottom arrived at trigY!
+                              val flushNextTileArrived = seenBlueInHold[l] &&
+                                  (now - t0[l] >= 120L) &&
+                                  laneIsPitchBlack(l, trigY) &&
+                                  laneIsPitchBlack(l, trigY - 4)
+
+                              if (lightCleared || flushNextTileArrived) {
+                                  FlightLog.log("DET", "L$l SLIDER CLEARED${if (flushNextTileArrived) " (FLUSH NEXT)" else ""}")
                                   state[l] = S.IDLE
-                                  cooldownUntil[l] = now + 15L
+                                  if (flushNextTileArrived) {
+                                      // Immediately trigger the flush follow-up tile in the same column on this frame!
+                                      triggerLane(l, trigY)
+                                  } else {
+                                      cooldownUntil[l] = now + 12L
+                                  }
                               }
                           }
                       }
@@ -245,7 +299,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Dedicated 1-finger primary-pointer taps (9ms) + multi-slider holds
+          # 4. TapService.kt - Non-overlapping sequential chord strokes in one GestureDescription
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -461,26 +515,36 @@ jobs:
                   var hasHold = false
                   var newHoldMask = 0
 
-                  // If preempting an active hold on the SAME lane, add a 14ms startTime gap
-                  // so the game sees ACTION_UP (at 0ms) before the new ACTION_DOWN (at 14ms)
-                  if (holdInFlight && ((activeHoldMask and (1 shl first.lane)) != 0)) {
-                      stagger = 14L
+                  // Whenever preempting an active slider hold, leave a 12ms finger-up gap at 0..12ms
+                  // so the game cleanly processes ACTION_UP on the finished slider before the new ACTION_DOWN!
+                  if (holdInFlight) {
+                      stagger = 12L
                   }
 
                   if (!first.isHold) {
-                      // Dispatch each short tap as its own dedicated 1-finger primary ACTION_DOWN -> ACTION_UP gesture (9ms).
-                      // When a 2-tile chord is queued, Tap 2 fires immediately in onCompleted (9ms later) as a primary pointer,
-                      // preventing the game from ever dropping a secondary ACTION_POINTER_DOWN event!
-                      val a = queue.poll() ?: return
-                      val x = Config.screenW * Config.laneFractions[a.lane]
-                      val y = Config.screenH * Config.triggerFrac
-                      val p = Path().apply {
-                          moveTo(x, y)
-                          lineTo(x, y)
+                      // Bundle chord taps into ONE GestureDescription with NON-OVERLAPPING time windows:
+                      // Tap 1: stagger .. stagger+16ms -> 6ms gap -> Tap 2: stagger+22ms .. stagger+38ms.
+                      // Because Tap 1 lifts up before Tap 2 touches down, both taps are primary 1-finger ACTION_DOWN events
+                      // spanning a full 60fps frame (16ms), delivered in a single atomic dispatchGesture call!
+                      while (true) {
+                          val a = queue.peek() ?: break
+                          if (a.isHold) break
+                          if (a.lane in used) break
+                          queue.poll()
+
+                          val x = Config.screenW * Config.laneFractions[a.lane]
+                          val y = Config.screenH * Config.triggerFrac
+                          val p = Path().apply {
+                              moveTo(x, y)
+                              lineTo(x, y)
+                          }
+                          val tapDur = a.durationMs.coerceIn(14L, 20L)
+                          strokes.add(StrokeDescription(p, stagger, tapDur, false))
+                          FlightLog.log("TOUCH", "L${a.lane} TAP (${tapDur}ms, offset=${stagger}ms)")
+                          // Advance stagger past the end of this tap + 6ms finger-up gap so the next chord tap is also a primary pointer
+                          stagger += tapDur + 6L
+                          used.add(a.lane)
                       }
-                      val safeDuration = a.durationMs.coerceIn(8L, 20L)
-                      strokes.add(StrokeDescription(p, stagger, safeDuration, false))
-                      FlightLog.log("TOUCH", "L${a.lane} TAP (${safeDuration}ms, offset=${stagger}ms)")
                   } else {
                       // Bundle simultaneous double-sliders (isHold == true) so both sliders hold together
                       while (true) {
