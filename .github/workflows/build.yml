@@ -469,4 +469,218 @@ jobs:
 
                   if (!first.isHold) {
                       // Dispatch each short tap as its own dedicated 1-finger primary ACTION_DOWN -> ACTION_UP gesture (9ms).
-                      // When a 2-tile chord is queued
+                      // When a 2-tile chord is queued, Tap 2 fires immediately in onCompleted (9ms later) as a primary pointer,
+                      // preventing the game from ever dropping a secondary ACTION_POINTER_DOWN event!
+                      val a = queue.poll() ?: return
+                      val x = Config.screenW * Config.laneFractions[a.lane]
+                      val y = Config.screenH * Config.triggerFrac
+                      val p = Path().apply {
+                          moveTo(x, y)
+                          lineTo(x, y)
+                      }
+                      val safeDuration = a.durationMs.coerceIn(8L, 20L)
+                      strokes.add(StrokeDescription(p, stagger, safeDuration, false))
+                      FlightLog.log("TOUCH", "L${a.lane} TAP (${safeDuration}ms, offset=${stagger}ms)")
+                  } else {
+                      // Bundle simultaneous double-sliders (isHold == true) so both sliders hold together
+                      while (true) {
+                          val a = queue.peek() ?: break
+                          if (!a.isHold) break
+                          if (a.lane in used) break
+                          queue.poll()
+
+                          val x = Config.screenW * Config.laneFractions[a.lane]
+                          val y = Config.screenH * Config.triggerFrac
+                          val p = Path().apply {
+                              moveTo(x, y)
+                              lineTo(x, y + 4f)
+                          }
+                          val safeDuration = a.durationMs.coerceIn(10L, 55000L)
+                          strokes.add(StrokeDescription(p, stagger, safeDuration, false))
+                          hasHold = true
+                          newHoldMask = newHoldMask or (1 shl a.lane)
+                          FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${safeDuration}ms, offset=${stagger}ms)")
+                          stagger += 2L
+                          used.add(a.lane)
+                      }
+                  }
+
+                  if (strokes.isEmpty()) return
+
+                  val g = GestureDescription.Builder().apply {
+                      strokes.forEach { addStroke(it) }
+                  }.build()
+
+                  val myId = ++activeGestureId
+                  if (hasHold) {
+                      holdInFlight = true
+                      tapInFlight = false
+                      activeHoldMask = newHoldMask
+                  } else {
+                      tapInFlight = true
+                      holdInFlight = false
+                      activeHoldMask = 0
+                  }
+
+                  val sent = dispatchGesture(g, object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) {
+                          if (myId != activeGestureId) return
+                          tapInFlight = false
+                          holdInFlight = false
+                          activeHoldMask = 0
+                          pump()
+                      }
+
+                      override fun onCancelled(d: GestureDescription?) {
+                          if (myId != activeGestureId) return
+                          FlightLog.log("WARN", "Gesture CANCELLED by OS")
+                          tapInFlight = false
+                          holdInFlight = false
+                          activeHoldMask = 0
+                          pump()
+                      }
+                  }, null)
+
+                  if (!sent) {
+                      FlightLog.log("ERROR", "dispatchGesture returned FALSE")
+                      if (myId == activeGestureId) {
+                          tapInFlight = false
+                          holdInFlight = false
+                          activeHoldMask = 0
+                      }
+                      mainHandler.postDelayed({ pump() }, 6L)
+                  }
+              }
+          }
+          EOF
+
+          # 5. MainActivity.kt
+          cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
+          package com.example.tilebot
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+
+          class MainActivity : ComponentActivity() {
+
+              private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
+
+              private val projLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  val data = r.data
+                  if (r.resultCode == RESULT_OK && data != null) {
+                      Config.isPaused = true
+                      TapService.instance?.refreshButton()
+                      startForegroundService(
+                          Intent(this, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", data)
+                      )
+                      Toast.makeText(this, "Capture started! Open Piano Tiles and tap the floating button.", Toast.LENGTH_LONG).show()
+                      moveTaskToBack(true)
+                  }
+              }
+
+              private val notifLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { launchCapture() }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Config.triggerFrac = prefs.getInt("trig", 65) / 100f
+                  Config.darkThreshold = prefs.getInt("dark", 95)
+                  Config.holdDurationMs = prefs.getInt("slider_hold_v6", 20000).toLong()
+
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
+
+                  root.addView(TextView(this).apply {
+                      text = "1. Enable TileBot Accessibility Service.\n" +
+                          "2. Tap Start Capture and choose \"Entire screen\".\n" +
+                          "3. Open the game, toggle BOT: ON, and tap Play!"
+                  })
+                  root.addView(Button(this).apply {
+                      text = "1. Open accessibility settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  root.addView(Button(this).apply { text = "2. Start Capture"; setOnClickListener { startBot() } })
+                  root.addView(Button(this).apply {
+                      text = "Stop Capture"
+                      setOnClickListener {
+                          Config.isPaused = true
+                          TapService.instance?.refreshButton()
+                          stopService(Intent(this@MainActivity, CaptureService::class.java))
+                      }
+                  })
+
+                  slider(root, "Trigger line (% of height)", 40, 85, (Config.triggerFrac * 100).toInt()) {
+                      Config.triggerFrac = it / 100f; prefs.edit().putInt("trig", it).apply()
+                  }
+                  slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
+                      Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
+                  }
+                  slider(root, "Max slider hold ms (Default 20000)", 5000, 30000, Config.holdDurationMs.toInt()) {
+                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("slider_hold_v6", it).apply()
+                  }
+                  setContentView(root)
+              }
+
+              private fun startBot() {
+                  if (TapService.instance == null) {
+                      Toast.makeText(this, "Enable the accessibility service first", Toast.LENGTH_LONG).show(); return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) else launchCapture()
+              }
+
+              private fun launchCapture() {
+                  val mgr = getSystemService(MediaProjectionManager::class.java)
+                  projLauncher.launch(mgr.createScreenCaptureIntent())
+              }
+
+              private fun slider(root: LinearLayout, label: String, min: Int, max: Int, init: Int, on: (Int) -> Unit) {
+                  val tv = TextView(this).apply { text = "$label: $init"; setPadding(0, 32, 0, 0) }
+                  val sb = SeekBar(this).apply {
+                      this.max = max - min
+                      progress = init - min
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                              tv.text = "$label: ${p + min}"; on(p + min)
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  root.addView(tv); root.addView(sb)
+              }
+          }
+          EOF
+
+          # 6. CaptureService buffer count
+          sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        working-directory: TileBot
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TileBot-apk
+          path: TileBot/app/build/outputs/apk/debug/app-debug.apk
