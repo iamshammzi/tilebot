@@ -30,12 +30,12 @@ jobs:
 
               val laneFractions = floatArrayOf(0.125f, 0.375f, 0.625f, 0.875f)
 
-              @Volatile var triggerFrac = 0.65f
+              @Volatile var triggerFrac = 0.56f
               @Volatile var darkThreshold = 52
               @Volatile var holdDurationMs = 20000L
               @Volatile var isPaused = true
 
-              const val TAP_MS = 18L
+              const val TAP_MS = 16L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Recognizes bright cyan slider fill + holds through completion dot (+40/+120 score)
+          # 3. TileDetector.kt - Tempo-matched natural ACTION_UP slider holds + 20s giant-slider fallback
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -87,18 +87,21 @@ jobs:
               private val t0 = LongArray(Config.LANES)
               private val cooldownUntil = LongArray(Config.LANES)
               private val seenBlueInHold = BooleanArray(Config.LANES)
+              private val isLongCeilingHold = BooleanArray(Config.LANES)
 
-              private var lastTapHitTime = 0L
-              private var beatMs = 240f
+              private var lastNoteHitTime = 0L
+              private var beatMs = 200f
+              private var lastFrameTime = 0L
 
               fun resetAll() {
                   for (i in 0 until Config.LANES) {
                       state[i] = S.IDLE
                       cooldownUntil[i] = 0L
                       seenBlueInHold[i] = false
+                      isLongCeilingHold[i] = false
                   }
-                  lastTapHitTime = 0L
-                  beatMs = 240f
+                  lastNoteHitTime = 0L
+                  beatMs = 200f
               }
 
               fun process(img: Image) {
@@ -107,6 +110,10 @@ jobs:
                       return
                   }
                   val now = SystemClock.uptimeMillis()
+                  // 8ms frame gate (~120fps max) so ByteBuffer scanning never starves the game's WebView GPU thread
+                  if (now - lastFrameTime < 8L) return
+                  lastFrameTime = now
+
                   val svc = TapService.instance ?: return
 
                   val plane = img.planes[0]
@@ -120,9 +127,6 @@ jobs:
                   val flushReleaseY = (trigY - 12).coerceAtLeast(10)
                   val rThr = Config.darkThreshold.coerceIn(38, 75)
 
-                  // Matches BOTH un-tapped black tiles (R < rThr, G < 68, B < 105)
-                  // AND royal-blue / bright-cyan filled sliders (B > 120, G > 55, B - R > 45, R < 145).
-                  // Excludes lavender/pink background (R > 140, B - R < 45) and faded tapped black tiles (R >= 55, B - R < 40).
                   fun dark(x: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val o = cy * rs + x * ps
@@ -145,7 +149,6 @@ jobs:
                       return c >= 2
                   }
 
-                  // Matches both un-filled royal-blue slider body AND filled bright-cyan slider body at outer lane points
                   fun laneIsSliderBlue(l: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -164,7 +167,6 @@ jobs:
                       return blue1 && blue2
                   }
 
-                  // True ONLY on the pitch-black bottom of a new tile/slider (away from the center cyan circle)
                   fun laneIsPitchBlackBottom(l: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -218,31 +220,47 @@ jobs:
                       return startY - top
                   }
 
-                  val tileH = h / 4f
-                  val minValidRun = (tileH * 0.46f).toInt().coerceIn(55, 72)
+                  val tileH = (h / 4.5f).coerceAtLeast(128f)
+                  val minValidRun = (tileH * 0.45f).toInt().coerceIn(55, 72)
                   val sliderRun = (tileH * 0.95f).toInt().coerceIn(145, 162)
                   var anyNewHit = false
-                  var anyFlushSliderRelease = false
+                  var anySliderRelease = false
                   var tapsThisFrame = 0
+
+                  fun updateTempo() {
+                      val dt = now - lastNoteHitTime
+                      if (dt in 120L..350L) {
+                          beatMs = (beatMs * 0.65f + dt * 0.35f).coerceIn(135f, 320f)
+                      } else if (dt in 351L..520L) {
+                          // 2-beat slider interval -> 1 beat is dt / 2
+                          val halfDt = dt * 0.5f
+                          beatMs = (beatMs * 0.70f + halfDt * 0.30f).coerceIn(135f, 320f)
+                      }
+                      lastNoteHitTime = now
+                  }
 
                   fun triggerLane(l: Int, scanY: Int) {
                       val run = runLengthFrom(l, scanY)
                       if (run >= sliderRun || isBlueSliderBody(l, scanY, run)) {
+                          updateTempo()
                           state[l] = S.HOLD
                           t0[l] = now
                           seenBlueInHold[l] = false
-                          val holdMs = Config.holdDurationMs
+                          // If the slider's top edge is visible on screen (run < scanY - 12), compute its exact hold duration
+                          // so the stroke completes naturally with genuine ACTION_UP right after bursting the white dot!
+                          // If its top edge is still off the top of the screen (giant slider), use the 20,000ms ceiling!
+                          val topVisible = run < (scanY - 12)
+                          val holdMs = if (topVisible) {
+                              ((run / tileH) * beatMs * 0.90f).toLong().coerceIn(220L, 1200L)
+                          } else {
+                              Config.holdDurationMs
+                          }
+                          isLongCeilingHold[l] = !topVisible
                           FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${holdMs}ms)")
-                          svc.enqueueHold(l, holdMs, (Config.triggerFrac - 0.015f).coerceAtLeast(0.45f))
+                          svc.enqueueHold(l, holdMs, Config.triggerFrac)
                           anyNewHit = true
                       } else if (run >= minValidRun) {
-                          if (tapsThisFrame == 0) {
-                              val dt = now - lastTapHitTime
-                              if (dt in 125L..400L) {
-                                  beatMs = (beatMs * 0.65f + dt * 0.35f).coerceIn(140f, 340f)
-                              }
-                              lastTapHitTime = now
-                          }
+                          if (tapsThisFrame == 0) updateTempo()
                           state[l] = S.TAPPED
                           t0[l] = now
                           val yFrac = if (tapsThisFrame > 0) (Config.triggerFrac + 0.025f).coerceAtMost(0.82f) else Config.triggerFrac
@@ -285,18 +303,12 @@ jobs:
                               if (!seenBlueInHold[l] && (laneIsSliderBlue(l, flushReleaseY) || laneIsSliderBlue(l, trigY))) {
                                   seenBlueInHold[l] = true
                               }
-                              // Case A: Flush 2nd tile stacked directly on top of this slider in the SAME column!
-                              // Release early at flushReleaseY (trigY - 12) ONLY when a pitch-black bottom is right above the slider.
                               val flushBlackAbove = seenBlueInHold[l] &&
-                                  (now - t0[l] >= 100L) &&
+                                  (now - t0[l] >= 90L) &&
                                   laneIsPitchBlackBottom(l, flushReleaseY) &&
                                   laneIsPitchBlackBottom(l, flushReleaseY - 3)
 
-                              // Case B: Normal slider followed by empty background in this column (98% of sliders).
-                              // Re-arm the detector state once the slider's top edge passes trigY + 6,
-                              // WITHOUT killing the active touch hold prematurely so the cyan bar 100% bursts the white completion dot
-                              // until the next note in the song naturally preempts it!
-                              val normalTailCleared = (now - t0[l] >= 80L) &&
+                              val normalTailCleared = (now - t0[l] >= 70L) &&
                                   !laneDark(l, trigY) &&
                                   !laneDark(l, (trigY + 6).coerceAtMost(h - 4))
 
@@ -304,11 +316,14 @@ jobs:
                                   FlightLog.log("DET", "L$l SLIDER CLEARED (FLUSH)")
                                   state[l] = S.IDLE
                                   cooldownUntil[l] = now + 10L
-                                  anyFlushSliderRelease = true
+                                  anySliderRelease = true
                               } else if (normalTailCleared) {
                                   FlightLog.log("DET", "L$l SLIDER CLEARED")
                                   state[l] = S.IDLE
                                   cooldownUntil[l] = now + 10L
+                                  if (isLongCeilingHold[l]) {
+                                      anySliderRelease = true
+                                  }
                               }
                           }
                       }
@@ -328,15 +343,14 @@ jobs:
                           }
                       }
                       svc.commitFrame()
-                  } else if (anyFlushSliderRelease && state.none { it == S.HOLD }) {
-                      // Only force-lift the finger early when a flush same-column tile is right above the slider!
+                  } else if (anySliderRelease && state.none { it == S.HOLD }) {
                       svc.releaseHoldNow()
                   }
               }
           }
           EOF
 
-          # 4. TapService.kt - Frame-separated 1-finger chord taps + full-completion slider holds
+          # 4. TapService.kt - Stationary zero-overhead holds + natural ACTION_UP completion
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -592,7 +606,6 @@ jobs:
                   var hasHold = false
                   var newHoldMask = 0
 
-                  // Only add a 10ms release gap if preempting an active hold on the SAME lane
                   if (holdInFlight && ((activeHoldMask and (1 shl first.lane)) != 0)) {
                       stagger = 10L
                   }
@@ -605,7 +618,7 @@ jobs:
                           moveTo(x, y)
                           lineTo(x, y)
                       }
-                      val safeDuration = a.durationMs.coerceIn(16L, 22L)
+                      val safeDuration = a.durationMs.coerceIn(14L, 20L)
                       strokes.add(StrokeDescription(p, stagger, safeDuration, false))
                       FlightLog.log("TOUCH", "L${a.lane} TAP (${safeDuration}ms, offset=${stagger}ms)")
                   } else {
@@ -617,9 +630,10 @@ jobs:
 
                           val x = Config.screenW * Config.laneFractions[a.lane]
                           val y = Config.screenH * a.yFrac
+                          // Stationary hold path (lineTo(x, y)) avoids flooding the WebView with 120Hz ACTION_MOVE events
                           val p = Path().apply {
                               moveTo(x, y)
-                              lineTo(x, y + 4f)
+                              lineTo(x, y)
                           }
                           val safeDuration = a.durationMs.coerceIn(10L, 55000L)
                           strokes.add(StrokeDescription(p, stagger, safeDuration, false))
@@ -729,7 +743,7 @@ jobs:
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  Config.triggerFrac = prefs.getInt("trig", 65) / 100f
+                  Config.triggerFrac = prefs.getInt("trig_v2", 56) / 100f
                   Config.darkThreshold = prefs.getInt("red_thr_v1", 52)
                   Config.holdDurationMs = prefs.getInt("slider_hold_v6", 20000).toLong()
 
@@ -737,8 +751,8 @@ jobs:
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
 
                   root.addView(TextView(this).apply {
-                      text = "1. Enable TileBot Accessibility Service.\n" +
-                          "2. Tap Start Capture and choose \"Entire screen\".\n" +
+                      text = "1. Turn OFF Battery Saver & set Display Refresh Rate to 120Hz.\n" +
+                          "2. Enable TileBot Accessibility Service & tap Start Capture.\n" +
                           "3. Open the game, toggle BOT: ON, and tap Play!"
                   })
                   root.addView(Button(this).apply {
@@ -755,8 +769,8 @@ jobs:
                       }
                   })
 
-                  slider(root, "Trigger line (% of height)", 40, 85, (Config.triggerFrac * 100).toInt()) {
-                      Config.triggerFrac = it / 100f; prefs.edit().putInt("trig", it).apply()
+                  slider(root, "Trigger line (% of height, Default 56)", 35, 80, (Config.triggerFrac * 100).toInt()) {
+                      Config.triggerFrac = it / 100f; prefs.edit().putInt("trig_v2", it).apply()
                   }
                   slider(root, "Red-channel tile threshold (Default 52)", 38, 75, Config.darkThreshold) {
                       Config.darkThreshold = it; prefs.edit().putInt("red_thr_v1", it).apply()
