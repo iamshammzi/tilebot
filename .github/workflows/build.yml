@@ -32,7 +32,6 @@ jobs:
 
               @Volatile var triggerFrac = 0.65f
               @Volatile var darkThreshold = 95
-              // 20-second ceiling: holds any slider (even 7s-15s finale sliders) until the next tile preempts it
               @Volatile var holdDurationMs = 20000L
               @Volatile var isPaused = true
 
@@ -74,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Detects all short/medium/mega sliders + 20s preemptible hold ceiling
+          # 3. TileDetector.kt - Same-column back-to-back gap detection + 20s preemptible holds
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -86,13 +85,11 @@ jobs:
 
               private val state = Array(Config.LANES) { S.IDLE }
               private val t0 = LongArray(Config.LANES)
-              private val clearCount = IntArray(Config.LANES)
               private val cooldownUntil = LongArray(Config.LANES)
 
               fun resetAll() {
                   for (i in 0 until Config.LANES) {
                       state[i] = S.IDLE
-                      clearCount[i] = 0
                       cooldownUntil[i] = 0L
                   }
               }
@@ -135,6 +132,19 @@ jobs:
                       return c >= 2
                   }
 
+                  // Detects any 2-row horizontal light gap between back-to-back tiles in the same column
+                  fun hasLightGapAtTrigger(l: Int): Boolean {
+                      var lightRun = 0
+                      for (y in (trigY - 4)..(trigY + 4)) {
+                          if (!laneDark(l, y)) {
+                              if (++lightRun >= 2) return true
+                          } else {
+                              lightRun = 0
+                          }
+                      }
+                      return false
+                  }
+
                   fun isBlueSliderBody(l: Int, startY: Int, run: Int): Boolean {
                       if (run < 95) return false
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -153,16 +163,16 @@ jobs:
                       return blueHits >= 2
                   }
 
+                  // Uses laneDark and gap >= 2 so stacked tiles in the same column are never merged into one run
                   fun runLengthFrom(l: Int, startY: Int): Int {
-                      val cx = (w * Config.laneFractions[l]).toInt()
                       var y = startY
                       var top = startY
                       var gap = 0
                       while (y >= 0) {
-                          if (dark(cx, y)) {
+                          if (laneDark(l, y)) {
                               top = y
                               gap = 0
-                          } else if (++gap >= 4) {
+                          } else if (++gap >= 2) {
                               break
                           }
                           y--
@@ -180,7 +190,6 @@ jobs:
                       if (run >= sliderRun || isBlueSliderBody(l, scanY, run)) {
                           state[l] = S.HOLD
                           t0[l] = now
-                          clearCount[l] = 0
                           val holdMs = Config.holdDurationMs
                           FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${holdMs}ms)")
                           svc.enqueueHold(l, holdMs)
@@ -188,7 +197,6 @@ jobs:
                       } else if (run >= minValidRun) {
                           state[l] = S.TAPPED
                           t0[l] = now
-                          clearCount[l] = 0
                           FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
                           svc.enqueueTap(l)
                           anyNewHit = true
@@ -201,34 +209,23 @@ jobs:
 
                       when (state[l]) {
                           S.IDLE -> {
-                              if (now >= cooldownUntil[l] && isDarkAtTrig && laneDark(l, trigY - 10)) {
+                              if (now >= cooldownUntil[l] && isDarkAtTrig && laneDark(l, trigY - 8)) {
                                   triggerLane(l, trigY)
                               }
                           }
                           S.TAPPED -> {
-                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6)
-                              if (!zoneDark) {
-                                  if (++clearCount[l] >= 2) {
-                                      state[l] = S.IDLE
-                                      cooldownUntil[l] = now + 25L
-                                  }
-                              } else {
-                                  clearCount[l] = 0
-                                  if (now - t0[l] >= 450L) {
-                                      state[l] = S.IDLE
-                                  }
+                              if (now - t0[l] >= 25L && hasLightGapAtTrigger(l)) {
+                                  state[l] = S.IDLE
+                                  cooldownUntil[l] = now + 12L
+                              } else if (now - t0[l] >= 420L) {
+                                  state[l] = S.IDLE
                               }
                           }
                           S.HOLD -> {
-                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6) || laneDark(l, trigY + 6)
-                              if (!zoneDark) {
-                                  if (++clearCount[l] >= 2) {
-                                      FlightLog.log("DET", "L$l SLIDER CLEARED")
-                                      state[l] = S.IDLE
-                                      cooldownUntil[l] = now + 85L
-                                  }
-                              } else {
-                                  clearCount[l] = 0
+                              if (now - t0[l] >= 40L && hasLightGapAtTrigger(l)) {
+                                  FlightLog.log("DET", "L$l SLIDER CLEARED")
+                                  state[l] = S.IDLE
+                                  cooldownUntil[l] = now + 15L
                               }
                           }
                       }
@@ -239,7 +236,7 @@ jobs:
                       val companionY = trigY - 10
                       for (l in 0 until Config.LANES) {
                           if (state[l] == S.IDLE && now >= cooldownUntil[l]) {
-                              if (laneDark(l, companionY) && laneDark(l, companionY - 10)) {
+                              if (laneDark(l, companionY) && laneDark(l, companionY - 8)) {
                                   triggerLane(l, companionY)
                               }
                           }
@@ -250,7 +247,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Atomic multi-finger batching + preemptible 20,000ms holds
+          # 4. TapService.kt - Same-column hold-release gap (14ms) + preemptible 20,000ms holds
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -289,6 +286,7 @@ jobs:
 
               private var tapInFlight = false
               private var holdInFlight = false
+              private var activeHoldMask = 0
               private var activeGestureId = 0
 
               private var wm: WindowManager? = null
@@ -445,6 +443,7 @@ jobs:
                   queue.clear()
                   tapInFlight = false
                   holdInFlight = false
+                  activeHoldMask = 0
               }
 
               private fun pump() {
@@ -452,6 +451,7 @@ jobs:
                       queue.clear()
                       tapInFlight = false
                       holdInFlight = false
+                      activeHoldMask = 0
                       return
                   }
                   if (tapInFlight) return
@@ -461,6 +461,14 @@ jobs:
                   val used = HashSet<Int>()
                   var stagger = 0L
                   var hasHold = false
+                  var newHoldMask = 0
+
+                  // If preempting an active hold on the SAME lane, add a 14ms startTime gap
+                  // so the game sees ACTION_UP (at 0ms) before the new ACTION_DOWN (at 14ms)
+                  val firstPeek = queue.peek()
+                  if (firstPeek != null && holdInFlight && ((activeHoldMask and (1 shl firstPeek.lane)) != 0)) {
+                      stagger = 14L
+                  }
 
                   while (true) {
                       val a = queue.peek() ?: break
@@ -479,7 +487,8 @@ jobs:
                       strokes.add(StrokeDescription(p, stagger, safeDuration, false))
                       if (a.isHold) {
                           hasHold = true
-                          FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${safeDuration}ms)")
+                          newHoldMask = newHoldMask or (1 shl a.lane)
+                          FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${safeDuration}ms, offset=${stagger}ms)")
                       } else {
                           FlightLog.log("TOUCH", "L${a.lane} TAP (${safeDuration}ms, offset=${stagger}ms)")
                       }
@@ -497,9 +506,11 @@ jobs:
                   if (hasHold) {
                       holdInFlight = true
                       tapInFlight = false
+                      activeHoldMask = newHoldMask
                   } else {
                       tapInFlight = true
                       holdInFlight = false
+                      activeHoldMask = 0
                   }
 
                   val sent = dispatchGesture(g, object : GestureResultCallback() {
@@ -507,6 +518,7 @@ jobs:
                           if (myId != activeGestureId) return
                           tapInFlight = false
                           holdInFlight = false
+                          activeHoldMask = 0
                           pump()
                       }
 
@@ -515,6 +527,7 @@ jobs:
                           FlightLog.log("WARN", "Gesture CANCELLED by OS")
                           tapInFlight = false
                           holdInFlight = false
+                          activeHoldMask = 0
                           pump()
                       }
                   }, null)
@@ -524,6 +537,7 @@ jobs:
                       if (myId == activeGestureId) {
                           tapInFlight = false
                           holdInFlight = false
+                          activeHoldMask = 0
                       }
                       mainHandler.postDelayed({ pump() }, 8L)
                   }
@@ -573,7 +587,6 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
-                  // New key "slider_hold_v6" sets default to 20,000ms (20 seconds)
                   Config.holdDurationMs = prefs.getInt("slider_hold_v6", 20000).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
