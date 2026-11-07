@@ -32,7 +32,7 @@ jobs:
 
               @Volatile var triggerFrac = 0.65f
               @Volatile var darkThreshold = 95
-              @Volatile var holdDurationMs = 2200L
+              @Volatile var holdDurationMs = 2400L
               @Volatile var isPaused = true
               @Volatile var resumeGraceUntil = 0L
 
@@ -74,7 +74,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Auto-start on stationary first tile + full unscaled slider hold
+          # 3. TileDetector.kt - Multi-height Auto-Start + Scroll-in tracking
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -88,6 +88,7 @@ jobs:
               private val t0 = LongArray(Config.LANES)
               private val clearCount = IntArray(Config.LANES)
               private val cooldownUntil = LongArray(Config.LANES)
+              private val entryY = IntArray(Config.LANES)
               private var lastActivityTime = 0L
 
               fun resetAll() {
@@ -95,6 +96,7 @@ jobs:
                       state[i] = S.IDLE
                       clearCount[i] = 0
                       cooldownUntil[i] = 0L
+                      entryY[i] = 0
                   }
                   lastActivityTime = 0L
               }
@@ -105,7 +107,7 @@ jobs:
                       return
                   }
                   val now = SystemClock.uptimeMillis()
-                  // Wait 250ms after tapping the floating BOT: ON button so physical finger lift never cancels the first hold
+                  // 300ms grace window after tapping BOT: ON so user's physical finger is completely off the screen
                   if (now < Config.resumeGraceUntil) return
 
                   val svc = TapService.instance ?: return
@@ -162,24 +164,26 @@ jobs:
                   val sliderRun = (tileH * 1.15f).toInt()
                   var anyNewHit = false
 
-                  fun triggerLane(l: Int, scanY: Int, touchFracY: Float) {
+                  fun triggerLane(l: Int, scanY: Int, startFracY: Float, endFracY: Float) {
                       val run = runLengthFrom(l, scanY)
                       if (run >= sliderRun) {
                           state[l] = S.HOLD
                           t0[l] = now
                           clearCount[l] = 0
+                          entryY[l] = scanY
                           lastActivityTime = now
                           val holdMs = Config.holdDurationMs
                           FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${holdMs}ms)")
-                          svc.enqueueHold(l, holdMs, touchFracY)
+                          svc.enqueueHold(l, holdMs, startFracY, endFracY)
                           anyNewHit = true
                       } else if (run >= minValidRun) {
                           state[l] = S.TAPPED
                           t0[l] = now
                           clearCount[l] = 0
+                          entryY[l] = scanY
                           lastActivityTime = now
                           FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
-                          svc.enqueueTap(l, touchFracY)
+                          svc.enqueueTap(l, startFracY)
                           anyNewHit = true
                       }
                   }
@@ -191,12 +195,13 @@ jobs:
                       when (state[l]) {
                           S.IDLE -> {
                               if (now >= cooldownUntil[l] && isDarkAtTrig && laneDark(l, trigY - 10)) {
-                                  triggerLane(l, trigY, Config.triggerFrac)
+                                  triggerLane(l, trigY, Config.triggerFrac, Config.triggerFrac)
                               }
                           }
                           S.TAPPED -> {
                               lastActivityTime = now
-                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6)
+                              val stillAtEntry = (now - t0[l] < 450L) && laneDark(l, entryY[l])
+                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6) || stillAtEntry
                               if (!zoneDark) {
                                   if (++clearCount[l] >= 2) {
                                       state[l] = S.IDLE
@@ -204,14 +209,16 @@ jobs:
                                   }
                               } else {
                                   clearCount[l] = 0
-                                  if (now - t0[l] >= 450L) {
+                                  if (now - t0[l] >= 550L) {
                                       state[l] = S.IDLE
                                   }
                               }
                           }
                           S.HOLD -> {
                               lastActivityTime = now
-                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6) || laneDark(l, trigY + 6)
+                              // If auto-started higher up (e.g. 43%), keep S.HOLD active while the slider scrolls down into trigY
+                              val stillAtEntry = (now - t0[l] < 600L) && (laneDark(l, entryY[l]) || laneDark(l, (entryY[l] + trigY) / 2))
+                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6) || laneDark(l, trigY + 6) || stillAtEntry
                               if (!zoneDark) {
                                   if (++clearCount[l] >= 2) {
                                       FlightLog.log("DET", "L$l SLIDER CLEARED")
@@ -231,7 +238,7 @@ jobs:
                       for (l in 0 until Config.LANES) {
                           if (state[l] == S.IDLE && now >= cooldownUntil[l]) {
                               if (laneDark(l, companionY) && laneDark(l, companionY - 10)) {
-                                  triggerLane(l, companionY, Config.triggerFrac)
+                                  triggerLane(l, companionY, Config.triggerFrac, Config.triggerFrac)
                               }
                           }
                       }
@@ -240,18 +247,22 @@ jobs:
                   }
 
                   // Pass 3: Auto-Start on "TAP TO PLAY" screen!
-                  // On the start screen, the first tile sits stationary around 55%-60% height (above 65% trigY).
+                  // On the start screen, the first tile sits stationary between 38% and 56% height (above 65% trigY).
                   val allIdle = state.all { it == S.IDLE }
-                  if (allIdle && (lastActivityTime == 0L || now - lastActivityTime >= 700L)) {
-                      val startFrac = (Config.triggerFrac - 0.08f).coerceAtLeast(0.50f)
-                      val startY = (h * startFrac).toInt()
-                      for (l in 0 until Config.LANES) {
-                          if (now >= cooldownUntil[l] && laneDark(l, startY) && laneDark(l, startY - 12)) {
-                              triggerLane(l, startY, startFrac)
-                              if (anyNewHit) {
-                                  FlightLog.log("DET", "L$l AUTO-START FIRST TILE")
-                                  svc.commitFrame()
-                                  break
+                  if (allIdle && (lastActivityTime == 0L || now - lastActivityTime >= 650L)) {
+                      val startFracs = floatArrayOf(0.56f, 0.50f, 0.44f, 0.38f)
+                      for (frac in startFracs) {
+                          val scanY = (h * frac).toInt()
+                          for (l in 0 until Config.LANES) {
+                              if (now >= cooldownUntil[l] && laneDark(l, scanY) && laneDark(l, scanY - 12)) {
+                                  // Touch slightly above the bottom edge of the starting tile and glide down to triggerFrac
+                                  val touchStartFrac = (frac - 0.03f).coerceAtLeast(0.35f)
+                                  triggerLane(l, scanY, touchStartFrac, Config.triggerFrac)
+                                  if (anyNewHit) {
+                                      FlightLog.log("DET", "L$l AUTO-START AT ${(frac * 100).toInt()}%")
+                                      svc.commitFrame()
+                                      return
+                                  }
                               }
                           }
                       }
@@ -260,7 +271,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Atomic multi-finger batching + preemptible full holds
+          # 4. TapService.kt - Supports glide-down auto-start holds + preemptible full holds
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -293,7 +304,13 @@ jobs:
                   @Volatile var instance: TapService? = null
               }
 
-              private class Action(val lane: Int, val durationMs: Long, val isHold: Boolean, val yFrac: Float)
+              private class Action(
+                  val lane: Int,
+                  val durationMs: Long,
+                  val isHold: Boolean,
+                  val startYFrac: Float,
+                  val endYFrac: Float
+              )
 
               private val mainHandler = Handler(Looper.getMainLooper())
               private val queue = ConcurrentLinkedQueue<Action>()
@@ -400,8 +417,8 @@ jobs:
                               if (abs(event.rawX - touchX) < 15 && abs(event.rawY - touchY) < 15) {
                                   Config.isPaused = !Config.isPaused
                                   if (!Config.isPaused) {
-                                      // 250ms grace window so user's physical finger fully lifts off screen before bot touches first tile
-                                      Config.resumeGraceUntil = SystemClock.uptimeMillis() + 250L
+                                      // 300ms grace window so user's physical finger fully lifts off screen before Auto-Start fires
+                                      Config.resumeGraceUntil = SystemClock.uptimeMillis() + 300L
                                   } else {
                                       releaseAll()
                                   }
@@ -444,12 +461,17 @@ jobs:
 
               fun enqueueTap(lane: Int, yFrac: Float = Config.triggerFrac) {
                   if (Config.isPaused) return
-                  queue.add(Action(lane, Config.TAP_MS, false, yFrac))
+                  queue.add(Action(lane, Config.TAP_MS, false, yFrac, yFrac))
               }
 
-              fun enqueueHold(lane: Int, durationMs: Long, yFrac: Float = Config.triggerFrac) {
+              fun enqueueHold(
+                  lane: Int,
+                  durationMs: Long,
+                  startYFrac: Float = Config.triggerFrac,
+                  endYFrac: Float = Config.triggerFrac
+              ) {
                   if (Config.isPaused) return
-                  queue.add(Action(lane, durationMs, true, yFrac))
+                  queue.add(Action(lane, durationMs, true, startYFrac, endYFrac))
               }
 
               fun commitFrame() {
@@ -485,10 +507,16 @@ jobs:
                       queue.poll()
 
                       val x = Config.screenW * Config.laneFractions[a.lane]
-                      val y = Config.screenH * a.yFrac
+                      val yStart = Config.screenH * a.startYFrac
+                      val yEnd = Config.screenH * a.endYFrac
                       val p = Path().apply {
-                          moveTo(x, y)
-                          if (a.isHold) lineTo(x, y + 4f) else lineTo(x, y)
+                          moveTo(x, yStart)
+                          if (a.isHold) {
+                              val targetY = if (abs(yEnd - yStart) > 4f) yEnd else (yStart + 4f)
+                              lineTo(x, targetY)
+                          } else {
+                              lineTo(x, yStart)
+                          }
                       }
 
                       strokes.add(StrokeDescription(p, stagger, a.durationMs, false))
@@ -588,8 +616,7 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
-                  // New key "slider_hold_v3" sets default to 2200ms so slow opening sliders are held 100%
-                  Config.holdDurationMs = prefs.getInt("slider_hold_v3", 2200).toLong()
+                  Config.holdDurationMs = prefs.getInt("slider_hold_v4", 2400).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
@@ -597,7 +624,7 @@ jobs:
                   root.addView(TextView(this).apply {
                       text = "1. Enable TileBot Accessibility Service.\n" +
                           "2. Tap Start Capture and choose \"Entire screen\".\n" +
-                          "3. Open the game: use the floating button to toggle ON/PAUSE, or tap LOG to copy debug data."
+                          "3. Open the game: tap the floating button to toggle ON/PAUSE (it will auto-start the first tile!)."
                   })
                   root.addView(Button(this).apply {
                       text = "1. Open accessibility settings"
@@ -619,8 +646,8 @@ jobs:
                   slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
                       Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
                   }
-                  slider(root, "Max slider hold ms (Default 2200)", 800, 2800, Config.holdDurationMs.toInt()) {
-                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("slider_hold_v3", it).apply()
+                  slider(root, "Max slider hold ms (Default 2400)", 800, 3000, Config.holdDurationMs.toInt()) {
+                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("slider_hold_v4", it).apply()
                   }
                   setContentView(root)
               }
