@@ -1,17 +1,22 @@
 name: Build APK
+
 on:
   workflow_dispatch:
   push:
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Unzip and patch project
         run: |
           if [ -f TileBot.zip ]; then
             unzip -q -o TileBot.zip
           fi
+
           echo "android.useAndroidX=true" >> TileBot/gradle.properties
           echo "org.gradle.jvmargs=-Xmx2048m" >> TileBot/gradle.properties
 
@@ -27,10 +32,10 @@ jobs:
 
               @Volatile var triggerFrac = 0.65f
               @Volatile var darkThreshold = 95
+              @Volatile var holdDurationMs = 240L
               @Volatile var isPaused = true
 
-              const val TAP_MS = 8L
-              const val BURST_INTERVAL_MS = 16L
+              const val TAP_MS = 12L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
@@ -68,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt
+          # 3. TileDetector.kt - Tail-safe & single-hit debounced detector
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -80,11 +85,15 @@ jobs:
 
               private val state = Array(Config.LANES) { S.IDLE }
               private val t0 = LongArray(Config.LANES)
-              private val lastBurstTime = LongArray(Config.LANES)
-              private val holdMiss = IntArray(Config.LANES)
+              private val clearCount = IntArray(Config.LANES)
+              private val cooldownUntil = LongArray(Config.LANES)
 
               fun resetAll() {
-                  for (i in 0 until Config.LANES) state[i] = S.IDLE
+                  for (i in 0 until Config.LANES) {
+                      state[i] = S.IDLE
+                      clearCount[i] = 0
+                      cooldownUntil[i] = 0L
+                  }
               }
 
               fun process(img: Image) {
@@ -101,13 +110,13 @@ jobs:
                   val ps = plane.pixelStride
                   val w = img.width
                   val h = img.height
-
                   val laneW = w / Config.LANES
-                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(4, h - 4)
+                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(16, h - 16)
                   val thr = Config.darkThreshold
 
                   fun dark(x: Int, y: Int): Boolean {
-                      val o = y * rs + x * ps
+                      val cy = y.coerceIn(0, h - 1)
+                      val o = cy * rs + x * ps
                       if (o + 2 >= buf.limit()) return false
                       val r = buf.get(o).toInt() and 255
                       val g = buf.get(o + 1).toInt() and 255
@@ -131,47 +140,71 @@ jobs:
                       var top = trigY
                       var gap = 0
                       while (y >= 0) {
-                          if (dark(cx, y)) { top = y; gap = 0 } else if (++gap >= 4) break
+                          if (dark(cx, y)) {
+                              top = y
+                              gap = 0
+                          } else if (++gap >= 4) {
+                              break
+                          }
                           y--
                       }
                       return trigY - top
                   }
 
                   val tileH = h / 4f
+                  // Minimum vertical body required to be a real incoming tile (blocks run=0..15 tail artifacts)
+                  val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
+                  val sliderRun = (tileH * 1.15f).toInt()
+
                   for (l in 0 until Config.LANES) {
-                      val isDark = laneDark(l, trigY)
+                      val isDarkAtTrig = laneDark(l, trigY)
+
                       when (state[l]) {
-                          S.IDLE -> if (isDark) {
-                              val run = runLength(l)
-                              if (run >= tileH * 1.10f) {
-                                  state[l] = S.HOLD
-                                  holdMiss[l] = 0
-                                  lastBurstTime[l] = now
-                                  FlightLog.log("DET", "L$l START BURST SLIDER (run=$run)")
-                                  svc.tap(l)
-                              } else {
-                                  state[l] = S.TAPPED
-                                  t0[l] = now
-                                  FlightLog.log("DET", "L$l SINGLE TAP (run=$run)")
-                                  svc.tap(l)
+                          S.IDLE -> {
+                              if (now >= cooldownUntil[l] && isDarkAtTrig && laneDark(l, trigY - 10)) {
+                                  val run = runLength(l)
+                                  if (run >= sliderRun) {
+                                      state[l] = S.HOLD
+                                      t0[l] = now
+                                      clearCount[l] = 0
+                                      FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run)")
+                                      svc.hold(l, Config.holdDurationMs)
+                                  } else if (run >= minValidRun) {
+                                      state[l] = S.TAPPED
+                                      t0[l] = now
+                                      clearCount[l] = 0
+                                      FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
+                                      svc.tap(l)
+                                  }
                               }
                           }
                           S.TAPPED -> {
-                              if (!isDark || (now - t0[l] >= 30L)) {
-                                  state[l] = S.IDLE
+                              // Wait until the entire tile body has scrolled past trigY before re-arming
+                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6)
+                              if (!zoneDark) {
+                                  if (++clearCount[l] >= 2) {
+                                      state[l] = S.IDLE
+                                      cooldownUntil[l] = now + 25L
+                                  }
+                              } else {
+                                  clearCount[l] = 0
+                                  // Safety fallback only if a dark overlay stays static for > 450ms
+                                  if (now - t0[l] >= 450L) {
+                                      state[l] = S.IDLE
+                                  }
                               }
                           }
                           S.HOLD -> {
-                              val above = laneDark(l, trigY - 2) || laneDark(l, trigY - 4)
-                              if (above) {
-                                  holdMiss[l] = 0
-                                  if (now - lastBurstTime[l] >= Config.BURST_INTERVAL_MS) {
-                                      lastBurstTime[l] = now
-                                      svc.tap(l)
+                              // Wait until the entire slider tail AND its trailing edge have completely cleared trigY
+                              val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6) || laneDark(l, trigY + 6)
+                              if (!zoneDark) {
+                                  if (++clearCount[l] >= 2) {
+                                      FlightLog.log("DET", "L$l SLIDER CLEARED")
+                                      state[l] = S.IDLE
+                                      cooldownUntil[l] = now + 90L
                                   }
-                              } else if (++holdMiss[l] >= 2) {
-                                  FlightLog.log("DET", "L$l BURST SLIDER END")
-                                  state[l] = S.IDLE
+                              } else {
+                                  clearCount[l] = 0
                               }
                           }
                       }
@@ -180,7 +213,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt
+          # 4. TapService.kt - Non-cancelling single-stroke gesture engine
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -212,8 +245,10 @@ jobs:
                   @Volatile var instance: TapService? = null
               }
 
+              private class Action(val lane: Int, val durationMs: Long, val isHold: Boolean)
+
               private val mainHandler = Handler(Looper.getMainLooper())
-              private val tapQueue = ConcurrentLinkedQueue<Int>()
+              private val queue = ConcurrentLinkedQueue<Action>()
               private var inFlight = false
 
               private var wm: WindowManager? = null
@@ -278,7 +313,7 @@ jobs:
                       setOnClickListener {
                           val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
                           cm.setPrimaryClip(ClipData.newPlainText("TileBotLog", FlightLog.dump()))
-                          Toast.makeText(this@TapService, "Debug Log Copied to Clipboard!", Toast.LENGTH_SHORT).show()
+                          Toast.makeText(this@TapService, "Debug Log Copied!", Toast.LENGTH_SHORT).show()
                       }
                   }
 
@@ -295,7 +330,7 @@ jobs:
                   var touchX = 0f
                   var touchY = 0f
 
-                  toggle.setOnTouchListener { v, event ->
+                  toggle.setOnTouchListener { _, event ->
                       when (event.action) {
                           MotionEvent.ACTION_DOWN -> {
                               startX = params.x
@@ -314,6 +349,7 @@ jobs:
                               if (abs(event.rawX - touchX) < 15 && abs(event.rawY - touchY) < 15) {
                                   Config.isPaused = !Config.isPaused
                                   FlightLog.log("SYS", "Bot toggled: ${if (Config.isPaused) "PAUSED" else "RUNNING"}")
+                                  if (Config.isPaused) releaseAll()
                                   updateButtonAppearance()
                               }
                               true
@@ -352,58 +388,76 @@ jobs:
 
               fun tap(lane: Int) {
                   if (Config.isPaused) return
-                  tapQueue.add(lane)
+                  queue.add(Action(lane, Config.TAP_MS, false))
+                  mainHandler.post { pump() }
+              }
+
+              fun hold(lane: Int, durationMs: Long) {
+                  if (Config.isPaused) return
+                  queue.add(Action(lane, durationMs, true))
                   mainHandler.post { pump() }
               }
 
               fun releaseAll() {
-                  tapQueue.clear()
+                  queue.clear()
               }
 
               private fun pump() {
                   if (inFlight) return
                   if (Config.isPaused) {
-                      tapQueue.clear()
+                      queue.clear()
                       return
                   }
 
-                  val builder = GestureDescription.Builder()
+                  val strokes = ArrayList<StrokeDescription>()
                   val used = HashSet<Int>()
-                  var count = 0
-                  var offset = 0L
+                  var stagger = 0L
 
                   while (true) {
-                      val lane = tapQueue.poll() ?: break
-                      if (lane in used) continue
+                      val a = queue.peek() ?: break
+                      if (a.lane in used) break
+                      queue.poll()
 
-                      val x = Config.screenW * Config.laneFractions[lane]
+                      val x = Config.screenW * Config.laneFractions[a.lane]
                       val y = Config.screenH * Config.triggerFrac
-                      val path = Path().apply {
+                      val p = Path().apply {
                           moveTo(x, y)
-                          lineTo(x, y)
+                          if (a.isHold) lineTo(x, y + 2f) else lineTo(x, y)
                       }
-                      builder.addStroke(StrokeDescription(path, offset, Config.TAP_MS, false))
-                      used.add(lane)
-                      count++
-                      offset += 2L
-                      if (count >= 4) break
+
+                      // Always willContinue = false so HyperOS never cancels the stroke
+                      strokes.add(StrokeDescription(p, stagger, a.durationMs, false))
+                      if (a.isHold) {
+                          FlightLog.log("TOUCH", "L${a.lane} SOLID HOLD (${a.durationMs}ms)")
+                      } else {
+                          FlightLog.log("TOUCH", "L${a.lane} TAP (${a.durationMs}ms, offset=${stagger}ms)")
+                      }
+                      stagger += 2L
+                      used.add(a.lane)
                   }
 
-                  if (count == 0) return
+                  if (strokes.isEmpty()) return
+
+                  val g = GestureDescription.Builder().apply {
+                      strokes.forEach { addStroke(it) }
+                  }.build()
 
                   inFlight = true
-                  val sent = dispatchGesture(builder.build(), object : GestureResultCallback() {
+                  val sent = dispatchGesture(g, object : GestureResultCallback() {
                       override fun onCompleted(d: GestureDescription?) {
                           inFlight = false
                           pump()
                       }
+
                       override fun onCancelled(d: GestureDescription?) {
+                          FlightLog.log("WARN", "Gesture CANCELLED by OS")
                           inFlight = false
                           pump()
                       }
                   }, null)
 
                   if (!sent) {
+                      FlightLog.log("ERROR", "dispatchGesture returned FALSE")
                       inFlight = false
                       mainHandler.postDelayed({ pump() }, 8L)
                   }
@@ -453,6 +507,7 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
+                  Config.holdDurationMs = prefs.getInt("hold", 240).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
@@ -481,6 +536,9 @@ jobs:
                   }
                   slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
                       Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
+                  }
+                  slider(root, "Slider hold duration ms (Default 240)", 80, 500, Config.holdDurationMs.toInt()) {
+                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("hold", it).apply()
                   }
                   setContentView(root)
               }
@@ -519,16 +577,20 @@ jobs:
 
           # 6. CaptureService buffer count
           sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+
       - name: Build debug APK
         working-directory: TileBot
         run: gradle assembleDebug --no-daemon
+
       - uses: actions/upload-artifact@v4
         with:
           name: TileBot-apk
