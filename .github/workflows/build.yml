@@ -15,7 +15,42 @@ jobs:
           echo "android.useAndroidX=true" >> TileBot/gradle.properties
           echo "org.gradle.jvmargs=-Xmx2048m" >> TileBot/gradle.properties
 
-          # 1. Config.kt
+          # 1. FlightLog.kt - Circular in-memory event logger
+          cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/FlightLog.kt
+          package com.example.tilebot
+
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.ConcurrentLinkedDeque
+
+          object FlightLog {
+              private const val MAX_ENTRIES = 120
+              private val logs = ConcurrentLinkedDeque<String>()
+              private val sdf = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+              fun log(tag: String, msg: String) {
+                  val timeStr = sdf.format(Date())
+                  logs.addLast("$timeStr | [$tag] $msg")
+                  while (logs.size > MAX_ENTRIES) {
+                      logs.pollFirst()
+                  }
+              }
+
+              fun dump(): String {
+                  if (logs.isEmpty()) return "No logs recorded yet."
+                  val sb = java.lang.StringBuilder()
+                  sb.append("=== TILEBOT FLIGHT RECORDER (Last ").append(logs.size).append(" events) ===\n")
+                  for (entry in logs) {
+                      sb.append(entry).append("\n")
+                  }
+                  sb.append("=== END OF LOG ===\n")
+                  return sb.toString()
+              }
+          }
+          EOF
+
+          # 2. Config.kt
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/Config.kt
           package com.example.tilebot
 
@@ -37,7 +72,7 @@ jobs:
           }
           EOF
 
-          # 2. TileDetector.kt - Restores proven 100k run-length detection with clean tail-tracking
+          # 3. TileDetector.kt - Instrumented with telemetry hooks
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -110,13 +145,16 @@ jobs:
                       val isDark = laneDark(l, trigY)
                       when (state[l]) {
                           S.IDLE -> if (isDark) {
-                              if (runLength(l) >= tileH * 1.15f) {
+                              val run = runLength(l)
+                              if (run >= tileH * 1.15f) {
                                   state[l] = S.HOLD
                                   holdMiss[l] = 0
+                                  FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, tileH=$tileH)")
                                   svc.press(l)
                               } else {
                                   state[l] = S.TAPPED
                                   t0[l] = now
+                                  FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
                                   svc.tap(l)
                               }
                           }
@@ -130,6 +168,7 @@ jobs:
                               if (above) {
                                   holdMiss[l] = 0
                               } else if (++holdMiss[l] >= 2) {
+                                  FlightLog.log("DET", "L$l SLIDER END -> RELEASE")
                                   svc.release(l)
                                   state[l] = S.IDLE
                               }
@@ -140,13 +179,15 @@ jobs:
           }
           EOF
 
-          # 3. TapService.kt - Non-conflicting natural stroke termination & fail-safe recovery
+          # 4. TapService.kt - Telemetry + Dual-Pill Floating Layout (Toggle + Copy Log)
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
           import android.accessibilityservice.AccessibilityService
           import android.accessibilityservice.GestureDescription
           import android.accessibilityservice.GestureDescription.StrokeDescription
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Intent
           import android.graphics.Color
           import android.graphics.Path
@@ -158,7 +199,9 @@ jobs:
           import android.view.MotionEvent
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
+          import android.widget.LinearLayout
           import android.widget.TextView
+          import android.widget.Toast
           import java.util.concurrent.ConcurrentLinkedQueue
           import java.util.concurrent.atomic.AtomicInteger
           import kotlin.math.abs
@@ -179,24 +222,27 @@ jobs:
               private var inFlight = false
 
               private var wm: WindowManager? = null
-              private var floatBtn: TextView? = null
+              private var overlayContainer: LinearLayout? = null
+              private var btnToggle: TextView? = null
 
               override fun onServiceConnected() {
                   instance = this
-                  createFloatingButton()
+                  FlightLog.log("SYS", "TapService connected")
+                  createFloatingUI()
               }
 
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
               override fun onInterrupt() {}
 
               override fun onUnbind(intent: Intent?): Boolean {
-                  removeFloatingButton()
+                  FlightLog.log("SYS", "TapService disconnected")
+                  removeFloatingUI()
                   instance = null
                   return super.onUnbind(intent)
               }
 
-              private fun createFloatingButton() {
-                  if (floatBtn != null) return
+              private fun createFloatingUI() {
+                  if (overlayContainer != null) return
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
                   val params = WindowManager.LayoutParams(
@@ -211,19 +257,50 @@ jobs:
                       y = 140
                   }
 
-                  val btn = TextView(this).apply {
-                      setTextColor(Color.WHITE)
-                      textSize = 13f
-                      setPadding(36, 20, 36, 20)
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(8, 8, 8, 8)
                   }
-                  updateButtonAppearance(btn)
+
+                  val toggle = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                      setPadding(28, 18, 28, 18)
+                  }
+                  btnToggle = toggle
+                  updateButtonAppearance()
+
+                  val copyBtn = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                      text = "📋 LOG"
+                      setPadding(24, 18, 24, 18)
+                      background = GradientDrawable().apply {
+                          cornerRadius = 36f
+                          setColor(Color.parseColor("#CC374151"))
+                          setStroke(2, Color.WHITE)
+                      }
+                      setOnClickListener {
+                          val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("TileBotLog", FlightLog.dump()))
+                          Toast.makeText(this@TapService, "Debug Log Copied to Clipboard!", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  val spacer = android.view.View(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(12, 1)
+                  }
+
+                  container.addView(toggle)
+                  container.addView(spacer)
+                  container.addView(copyBtn)
 
                   var startX = 0
                   var startY = 0
                   var touchX = 0f
                   var touchY = 0f
 
-                  btn.setOnTouchListener { v, event ->
+                  toggle.setOnTouchListener { v, event ->
                       when (event.action) {
                           MotionEvent.ACTION_DOWN -> {
                               startX = params.x
@@ -235,14 +312,15 @@ jobs:
                           MotionEvent.ACTION_MOVE -> {
                               params.x = startX + (event.rawX - touchX).toInt()
                               params.y = startY + (event.rawY - touchY).toInt()
-                              wm?.updateViewLayout(v, params)
+                              wm?.updateViewLayout(overlayContainer, params)
                               true
                           }
                           MotionEvent.ACTION_UP -> {
                               if (abs(event.rawX - touchX) < 15 && abs(event.rawY - touchY) < 15) {
                                   Config.isPaused = !Config.isPaused
+                                  FlightLog.log("SYS", "Bot toggled: ${if (Config.isPaused) "PAUSED" else "RUNNING"}")
                                   if (Config.isPaused) releaseAll()
-                                  updateButtonAppearance(btn)
+                                  updateButtonAppearance()
                               }
                               true
                           }
@@ -250,29 +328,32 @@ jobs:
                       }
                   }
 
-                  wm?.addView(btn, params)
-                  floatBtn = btn
+                  wm?.addView(container, params)
+                  overlayContainer = container
               }
 
               fun refreshButton() {
-                  mainHandler.post { floatBtn?.let { updateButtonAppearance(it) } }
+                  mainHandler.post { updateButtonAppearance() }
               }
 
-              private fun updateButtonAppearance(btn: TextView) {
-                  val bg = GradientDrawable().apply {
-                      cornerRadius = 40f
-                      setColor(if (Config.isPaused) Color.parseColor("#CC1F2937") else Color.parseColor("#CC10B981"))
-                      setStroke(3, Color.WHITE)
+              private fun updateButtonAppearance() {
+                  btnToggle?.let { btn ->
+                      val bg = GradientDrawable().apply {
+                          cornerRadius = 36f
+                          setColor(if (Config.isPaused) Color.parseColor("#CC1F2937") else Color.parseColor("#CC10B981"))
+                          setStroke(2, Color.WHITE)
+                      }
+                      btn.background = bg
+                      btn.text = if (Config.isPaused) "▶ BOT: PAUSED" else "⏸ BOT: ON"
                   }
-                  btn.background = bg
-                  btn.text = if (Config.isPaused) "▶ BOT: PAUSED" else "⏸ BOT: ON"
               }
 
-              private fun removeFloatingButton() {
-                  floatBtn?.let {
+              private fun removeFloatingUI() {
+                  overlayContainer?.let {
                       try { wm?.removeView(it) } catch (_: Exception) {}
                   }
-                  floatBtn = null
+                  overlayContainer = null
+                  btnToggle = null
               }
 
               fun tap(lane: Int) {
@@ -309,7 +390,6 @@ jobs:
                   val strokes = ArrayList<StrokeDescription>()
                   val used = HashSet<Int>()
 
-                  // 1. Continue active holds. If released, simply omit it: Android auto-lifts the finger naturally!
                   val it = activeHolds.entries.iterator()
                   while (it.hasNext()) {
                       val e = it.next()
@@ -322,12 +402,11 @@ jobs:
                           strokes.add(h.stroke)
                           used.add(e.key)
                       } else {
-                          // Removed from active holds; Android automatically executes ACTION_POINTER_UP
+                          FlightLog.log("TOUCH", "L${e.key} hold stroke omitted (auto-lift)")
                           it.remove()
                       }
                   }
 
-                  // 2. Queue new taps and newly initiated holds
                   while (true) {
                       val a = queue.poll() ?: break
                       if (a.lane in used) continue
@@ -338,8 +417,10 @@ jobs:
                           val s = StrokeDescription(path, 0L, Config.HOLD_STEP_MS, true)
                           activeHolds[a.lane] = HoldState(s, x, y)
                           strokes.add(s)
+                          FlightLog.log("TOUCH", "L${a.lane} initiated NEW HOLD")
                       } else {
                           strokes.add(StrokeDescription(path, 0L, Config.TAP_MS, false))
+                          FlightLog.log("TOUCH", "L${a.lane} initiated NEW TAP")
                       }
                       used.add(a.lane)
                   }
@@ -357,6 +438,7 @@ jobs:
                           pump()
                       }
                       override fun onCancelled(d: GestureDescription?) {
+                          FlightLog.log("WARN", "Gesture CANCELLED by OS! activeHolds cleared.")
                           inFlight = false
                           activeHolds.clear()
                           pump()
@@ -364,15 +446,16 @@ jobs:
                   }, null)
 
                   if (!sent) {
+                      FlightLog.log("ERROR", "dispatchGesture returned FALSE! OS rejected gesture.")
                       inFlight = false
-                      activeHolds.clear() // Prevent stale continueStroke loops
+                      activeHolds.clear()
                       mainHandler.postDelayed({ pump() }, 10L)
                   }
               }
           }
           EOF
 
-          # 4. MainActivity.kt
+          # 5. MainActivity.kt
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/MainActivity.kt
           package com.example.tilebot
 
@@ -403,7 +486,7 @@ jobs:
                       startForegroundService(
                           Intent(this, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", data)
                       )
-                      Toast.makeText(this, "Armed. Open Piano Tiles and tap the floating button when ready!", Toast.LENGTH_LONG).show()
+                      Toast.makeText(this, "Capture started! Open the game and tap the floating button.", Toast.LENGTH_LONG).show()
                       moveTaskToBack(true)
                   }
               }
@@ -421,7 +504,7 @@ jobs:
                   root.addView(TextView(this).apply {
                       text = "1. Enable TileBot Accessibility Service.\n" +
                           "2. Tap Start Capture and choose \"Entire screen\".\n" +
-                          "3. Open the game and tap BOT: PAUSED -> BOT: ON to play!"
+                          "3. Open the game: use the floating button to toggle ON/PAUSE, or tap LOG to copy debug data."
                   })
                   root.addView(Button(this).apply {
                       text = "1. Open accessibility settings"
@@ -478,7 +561,7 @@ jobs:
           }
           EOF
 
-          # 5. CaptureService buffer count
+          # 6. CaptureService buffer count
           sed -i 's/PixelFormat.RGBA_8888, 2/PixelFormat.RGBA_8888, 4/g' TileBot/app/src/main/java/com/example/tilebot/CaptureService.kt
       - uses: actions/setup-java@v4
         with:
