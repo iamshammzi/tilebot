@@ -32,7 +32,7 @@ jobs:
 
               @Volatile var triggerFrac = 0.65f
               @Volatile var darkThreshold = 95
-              @Volatile var holdDurationMs = 720L
+              @Volatile var holdDurationMs = 1650L
               @Volatile var isPaused = true
 
               const val TAP_MS = 12L
@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Full-slider proportional duration + tail-safe debounce
+          # 3. TileDetector.kt - Frame-batched multi-touch + full-length slider hold
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -111,7 +111,7 @@ jobs:
                   val w = img.width
                   val h = img.height
                   val laneW = w / Config.LANES
-                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(16, h - 16)
+                  val trigY = (h * Config.triggerFrac).toInt().coerceIn(20, h - 20)
                   val thr = Config.darkThreshold
 
                   fun dark(x: Int, y: Int): Boolean {
@@ -134,10 +134,10 @@ jobs:
                       return c >= 2
                   }
 
-                  fun runLength(l: Int): Int {
+                  fun runLengthFrom(l: Int, startY: Int): Int {
                       val cx = (w * Config.laneFractions[l]).toInt()
-                      var y = trigY
-                      var top = trigY
+                      var y = startY
+                      var top = startY
                       var gap = 0
                       while (y >= 0) {
                           if (dark(cx, y)) {
@@ -148,37 +148,44 @@ jobs:
                           }
                           y--
                       }
-                      return trigY - top
+                      return startY - top
                   }
 
                   val tileH = h / 4f
                   val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
                   val sliderRun = (tileH * 1.15f).toInt()
+                  var anyNewHit = false
 
+                  fun triggerLane(l: Int, scanY: Int) {
+                      val run = runLengthFrom(l, scanY)
+                      if (run >= sliderRun) {
+                          state[l] = S.HOLD
+                          t0[l] = now
+                          clearCount[l] = 0
+                          val fullRun = (scanY * 0.85f).coerceAtLeast(280f)
+                          val scaledHold = ((Config.holdDurationMs * (run / fullRun)).toLong())
+                              .coerceIn(550L, Config.holdDurationMs)
+                          FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${scaledHold}ms)")
+                          svc.enqueueHold(l, scaledHold)
+                          anyNewHit = true
+                      } else if (run >= minValidRun) {
+                          state[l] = S.TAPPED
+                          t0[l] = now
+                          clearCount[l] = 0
+                          FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
+                          svc.enqueueTap(l)
+                          anyNewHit = true
+                      }
+                  }
+
+                  // Pass 1: Check primary trigger line across all 4 lanes
                   for (l in 0 until Config.LANES) {
                       val isDarkAtTrig = laneDark(l, trigY)
 
                       when (state[l]) {
                           S.IDLE -> {
                               if (now >= cooldownUntil[l] && isDarkAtTrig && laneDark(l, trigY - 10)) {
-                                  val run = runLength(l)
-                                  if (run >= sliderRun) {
-                                      state[l] = S.HOLD
-                                      t0[l] = now
-                                      clearCount[l] = 0
-                                      // Scale hold duration to slider length (medium ~260px vs full ~411px)
-                                      val fullRun = (trigY * 0.85f).coerceAtLeast(280f)
-                                      val scaledHold = ((Config.holdDurationMs * (run / fullRun)).toLong())
-                                          .coerceIn(380L, Config.holdDurationMs)
-                                      FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${scaledHold}ms)")
-                                      svc.hold(l, scaledHold)
-                                  } else if (run >= minValidRun) {
-                                      state[l] = S.TAPPED
-                                      t0[l] = now
-                                      clearCount[l] = 0
-                                      FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
-                                      svc.tap(l)
-                                  }
+                                  triggerLane(l, trigY)
                               }
                           }
                           S.TAPPED -> {
@@ -209,11 +216,25 @@ jobs:
                           }
                       }
                   }
+
+                  // Pass 2: If any lane triggered on this frame, check if a companion chord/double-slider lane
+                  // is within 10px above trigY so both fingers always dispatch in the exact same gesture
+                  if (anyNewHit) {
+                      val companionY = trigY - 10
+                      for (l in 0 until Config.LANES) {
+                          if (state[l] == S.IDLE && now >= cooldownUntil[l]) {
+                              if (laneDark(l, companionY) && laneDark(l, companionY - 10)) {
+                                  triggerLane(l, companionY)
+                              }
+                          }
+                      }
+                      svc.commitFrame()
+                  }
               }
           }
           EOF
 
-          # 4. TapService.kt - Preemptible full-length hold engine with GestureId tracking
+          # 4. TapService.kt - Atomic multi-finger batching + preemptible full holds
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -250,7 +271,6 @@ jobs:
               private val mainHandler = Handler(Looper.getMainLooper())
               private val queue = ConcurrentLinkedQueue<Action>()
 
-              // Separate short tap lock (12ms) from long hold state (preemptible by new tiles)
               private var tapInFlight = false
               private var holdInFlight = false
               private var activeGestureId = 0
@@ -390,15 +410,18 @@ jobs:
                   btnToggle = null
               }
 
-              fun tap(lane: Int) {
+              fun enqueueTap(lane: Int) {
                   if (Config.isPaused) return
                   queue.add(Action(lane, Config.TAP_MS, false))
-                  mainHandler.post { pump() }
               }
 
-              fun hold(lane: Int, durationMs: Long) {
+              fun enqueueHold(lane: Int, durationMs: Long) {
                   if (Config.isPaused) return
                   queue.add(Action(lane, durationMs, true))
+              }
+
+              fun commitFrame() {
+                  if (Config.isPaused) return
                   mainHandler.post { pump() }
               }
 
@@ -415,8 +438,6 @@ jobs:
                       holdInFlight = false
                       return
                   }
-                  // Wait only if a 12ms short tap is currently executing;
-                  // if a long slider hold is executing (holdInFlight), allow new actions to preempt it immediately!
                   if (tapInFlight) return
                   if (queue.isEmpty()) return
 
@@ -428,7 +449,6 @@ jobs:
                   while (true) {
                       val a = queue.peek() ?: break
                       if (a.lane in used) break
-                      // Do not bundle a long hold and a short tap into the same gesture; let each dispatch cleanly
                       if (strokes.isNotEmpty() && (a.isHold != hasHold)) break
                       queue.poll()
 
@@ -474,7 +494,6 @@ jobs:
                       }
 
                       override fun onCancelled(d: GestureDescription?) {
-                          // Ignore expected cancellation when a newer gesture preempted an active slider hold
                           if (myId != activeGestureId) return
                           FlightLog.log("WARN", "Gesture CANCELLED by OS")
                           tapInFlight = false
@@ -537,8 +556,8 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
-                  // Use new key "full_hold" so old 240ms saved preference doesn't override the new 720ms default
-                  Config.holdDurationMs = prefs.getInt("full_hold", 720).toLong()
+                  // Use key "slider_hold_v2" so the new 1650ms full-slider default takes effect immediately
+                  Config.holdDurationMs = prefs.getInt("slider_hold_v2", 1650).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
@@ -568,8 +587,8 @@ jobs:
                   slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
                       Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
                   }
-                  slider(root, "Max slider hold ms (Default 720)", 300, 1100, Config.holdDurationMs.toInt()) {
-                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("full_hold", it).apply()
+                  slider(root, "Max slider hold ms (Default 1650)", 600, 2400, Config.holdDurationMs.toInt()) {
+                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("slider_hold_v2", it).apply()
                   }
                   setContentView(root)
               }
