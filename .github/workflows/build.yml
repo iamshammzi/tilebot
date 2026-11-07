@@ -32,7 +32,7 @@ jobs:
 
               @Volatile var triggerFrac = 0.65f
               @Volatile var darkThreshold = 95
-              @Volatile var holdDurationMs = 240L
+              @Volatile var holdDurationMs = 720L
               @Volatile var isPaused = true
 
               const val TAP_MS = 12L
@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Tail-safe & single-hit debounced detector
+          # 3. TileDetector.kt - Full-slider proportional duration + tail-safe debounce
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -152,7 +152,6 @@ jobs:
                   }
 
                   val tileH = h / 4f
-                  // Minimum vertical body required to be a real incoming tile (blocks run=0..15 tail artifacts)
                   val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
                   val sliderRun = (tileH * 1.15f).toInt()
 
@@ -167,8 +166,12 @@ jobs:
                                       state[l] = S.HOLD
                                       t0[l] = now
                                       clearCount[l] = 0
-                                      FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run)")
-                                      svc.hold(l, Config.holdDurationMs)
+                                      // Scale hold duration to slider length (medium ~260px vs full ~411px)
+                                      val fullRun = (trigY * 0.85f).coerceAtLeast(280f)
+                                      val scaledHold = ((Config.holdDurationMs * (run / fullRun)).toLong())
+                                          .coerceIn(380L, Config.holdDurationMs)
+                                      FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${scaledHold}ms)")
+                                      svc.hold(l, scaledHold)
                                   } else if (run >= minValidRun) {
                                       state[l] = S.TAPPED
                                       t0[l] = now
@@ -179,7 +182,6 @@ jobs:
                               }
                           }
                           S.TAPPED -> {
-                              // Wait until the entire tile body has scrolled past trigY before re-arming
                               val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6)
                               if (!zoneDark) {
                                   if (++clearCount[l] >= 2) {
@@ -188,20 +190,18 @@ jobs:
                                   }
                               } else {
                                   clearCount[l] = 0
-                                  // Safety fallback only if a dark overlay stays static for > 450ms
                                   if (now - t0[l] >= 450L) {
                                       state[l] = S.IDLE
                                   }
                               }
                           }
                           S.HOLD -> {
-                              // Wait until the entire slider tail AND its trailing edge have completely cleared trigY
                               val zoneDark = isDarkAtTrig || laneDark(l, trigY - 6) || laneDark(l, trigY + 6)
                               if (!zoneDark) {
                                   if (++clearCount[l] >= 2) {
                                       FlightLog.log("DET", "L$l SLIDER CLEARED")
                                       state[l] = S.IDLE
-                                      cooldownUntil[l] = now + 90L
+                                      cooldownUntil[l] = now + 85L
                                   }
                               } else {
                                   clearCount[l] = 0
@@ -213,7 +213,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Non-cancelling single-stroke gesture engine
+          # 4. TapService.kt - Preemptible full-length hold engine with GestureId tracking
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -249,7 +249,11 @@ jobs:
 
               private val mainHandler = Handler(Looper.getMainLooper())
               private val queue = ConcurrentLinkedQueue<Action>()
-              private var inFlight = false
+
+              // Separate short tap lock (12ms) from long hold state (preemptible by new tiles)
+              private var tapInFlight = false
+              private var holdInFlight = false
+              private var activeGestureId = 0
 
               private var wm: WindowManager? = null
               private var overlayContainer: LinearLayout? = null
@@ -400,35 +404,45 @@ jobs:
 
               fun releaseAll() {
                   queue.clear()
+                  tapInFlight = false
+                  holdInFlight = false
               }
 
               private fun pump() {
-                  if (inFlight) return
                   if (Config.isPaused) {
                       queue.clear()
+                      tapInFlight = false
+                      holdInFlight = false
                       return
                   }
+                  // Wait only if a 12ms short tap is currently executing;
+                  // if a long slider hold is executing (holdInFlight), allow new actions to preempt it immediately!
+                  if (tapInFlight) return
+                  if (queue.isEmpty()) return
 
                   val strokes = ArrayList<StrokeDescription>()
                   val used = HashSet<Int>()
                   var stagger = 0L
+                  var hasHold = false
 
                   while (true) {
                       val a = queue.peek() ?: break
                       if (a.lane in used) break
+                      // Do not bundle a long hold and a short tap into the same gesture; let each dispatch cleanly
+                      if (strokes.isNotEmpty() && (a.isHold != hasHold)) break
                       queue.poll()
 
                       val x = Config.screenW * Config.laneFractions[a.lane]
                       val y = Config.screenH * Config.triggerFrac
                       val p = Path().apply {
                           moveTo(x, y)
-                          if (a.isHold) lineTo(x, y + 2f) else lineTo(x, y)
+                          if (a.isHold) lineTo(x, y + 4f) else lineTo(x, y)
                       }
 
-                      // Always willContinue = false so HyperOS never cancels the stroke
                       strokes.add(StrokeDescription(p, stagger, a.durationMs, false))
                       if (a.isHold) {
-                          FlightLog.log("TOUCH", "L${a.lane} SOLID HOLD (${a.durationMs}ms)")
+                          hasHold = true
+                          FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${a.durationMs}ms)")
                       } else {
                           FlightLog.log("TOUCH", "L${a.lane} TAP (${a.durationMs}ms, offset=${stagger}ms)")
                       }
@@ -442,23 +456,39 @@ jobs:
                       strokes.forEach { addStroke(it) }
                   }.build()
 
-                  inFlight = true
+                  val myId = ++activeGestureId
+                  if (hasHold) {
+                      holdInFlight = true
+                      tapInFlight = false
+                  } else {
+                      tapInFlight = true
+                      holdInFlight = false
+                  }
+
                   val sent = dispatchGesture(g, object : GestureResultCallback() {
                       override fun onCompleted(d: GestureDescription?) {
-                          inFlight = false
+                          if (myId != activeGestureId) return
+                          tapInFlight = false
+                          holdInFlight = false
                           pump()
                       }
 
                       override fun onCancelled(d: GestureDescription?) {
+                          // Ignore expected cancellation when a newer gesture preempted an active slider hold
+                          if (myId != activeGestureId) return
                           FlightLog.log("WARN", "Gesture CANCELLED by OS")
-                          inFlight = false
+                          tapInFlight = false
+                          holdInFlight = false
                           pump()
                       }
                   }, null)
 
                   if (!sent) {
                       FlightLog.log("ERROR", "dispatchGesture returned FALSE")
-                      inFlight = false
+                      if (myId == activeGestureId) {
+                          tapInFlight = false
+                          holdInFlight = false
+                      }
                       mainHandler.postDelayed({ pump() }, 8L)
                   }
               }
@@ -507,7 +537,8 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
-                  Config.holdDurationMs = prefs.getInt("hold", 240).toLong()
+                  // Use new key "full_hold" so old 240ms saved preference doesn't override the new 720ms default
+                  Config.holdDurationMs = prefs.getInt("full_hold", 720).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
@@ -537,8 +568,8 @@ jobs:
                   slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
                       Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
                   }
-                  slider(root, "Slider hold duration ms (Default 240)", 80, 500, Config.holdDurationMs.toInt()) {
-                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("hold", it).apply()
+                  slider(root, "Max slider hold ms (Default 720)", 300, 1100, Config.holdDurationMs.toInt()) {
+                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("full_hold", it).apply()
                   }
                   setContentView(root)
               }
