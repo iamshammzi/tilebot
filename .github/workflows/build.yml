@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Frame-batched multi-touch + 4500ms giant-slider support (no auto-start)
+          # 3. TileDetector.kt - Detects short sliders (run=176..181) via 0.95f threshold + Blue RGB check
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -134,6 +134,26 @@ jobs:
                       return c >= 2
                   }
 
+                  // Checks if the upper body of the tile has the royal-blue / cyan color of a slider
+                  // (Black tiles have R~15, G~15, B~25; Blue sliders have R<40, B>95, B-R>40)
+                  fun isBlueSliderBody(l: Int, startY: Int, run: Int): Boolean {
+                      if (run < 95) return false
+                      val cx = (w * Config.laneFractions[l]).toInt()
+                      val d = (laneW / 6).coerceAtLeast(3)
+                      val sampleY = (startY - (run * 0.55f).toInt()).coerceIn(4, h - 4)
+                      var blueHits = 0
+                      val xs = intArrayOf(cx - d, cx, cx + d)
+                      for (px in xs) {
+                          val o = sampleY * rs + px * ps
+                          if (o + 2 < buf.limit()) {
+                              val r = buf.get(o).toInt() and 255
+                              val b = buf.get(o + 2).toInt() and 255
+                              if (b > 90 && (b - r) > 38) blueHits++
+                          }
+                      }
+                      return blueHits >= 2
+                  }
+
                   fun runLengthFrom(l: Int, startY: Int): Int {
                       val cx = (w * Config.laneFractions[l]).toInt()
                       var y = startY
@@ -153,12 +173,13 @@ jobs:
 
                   val tileH = h / 4f
                   val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
-                  val sliderRun = (tileH * 1.15f).toInt()
+                  // Short black tiles are run=124..135; short blue sliders are run=170..185
+                  val sliderRun = (tileH * 0.95f).toInt().coerceIn(145, 162)
                   var anyNewHit = false
 
                   fun triggerLane(l: Int, scanY: Int) {
                       val run = runLengthFrom(l, scanY)
-                      if (run >= sliderRun) {
+                      if (run >= sliderRun || isBlueSliderBody(l, scanY, run)) {
                           state[l] = S.HOLD
                           t0[l] = now
                           clearCount[l] = 0
@@ -553,7 +574,6 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
-                  // New key "slider_hold_v5" sets default to 4500ms so giant 2.7s+ sliders are held 100%
                   Config.holdDurationMs = prefs.getInt("slider_hold_v5", 4500).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
