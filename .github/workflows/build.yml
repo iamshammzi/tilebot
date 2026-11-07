@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Red-channel un-faded tile filter + early slider release (trigY - 18)
+          # 3. TileDetector.kt - Live tempo tracking (0.68 * beatMs unlock) + minValidRun=58 + early slider release
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -88,12 +88,17 @@ jobs:
               private val cooldownUntil = LongArray(Config.LANES)
               private val seenBlueInHold = BooleanArray(Config.LANES)
 
+              private var lastTapHitTime = 0L
+              private var beatMs = 240f
+
               fun resetAll() {
                   for (i in 0 until Config.LANES) {
                       state[i] = S.IDLE
                       cooldownUntil[i] = 0L
                       seenBlueInHold[i] = false
                   }
+                  lastTapHitTime = 0L
+                  beatMs = 240f
               }
 
               fun process(img: Image) {
@@ -115,9 +120,6 @@ jobs:
                   val releaseY = (trigY - 18).coerceAtLeast(10)
                   val rThr = Config.darkThreshold.coerceIn(38, 75)
 
-                  // Un-tapped black tiles have R=10..35, G=10..45, B=15..70.
-                  // Blue sliders (dark bottom, royal-blue body, and cyan fill) have R=5..42.
-                  // Faded (already-tapped) black tiles and silver bevel borders have R=58..160 -> immediately false!
                   fun dark(x: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val o = cy * rs + x * ps
@@ -160,7 +162,7 @@ jobs:
                   }
 
                   fun hasLightGapAtTrigger(l: Int): Boolean {
-                      for (y in (trigY - 5)..(trigY + 5)) {
+                      for (y in (trigY - 12)..(trigY + 8)) {
                           if (!laneDark(l, y)) return true
                       }
                       return false
@@ -195,7 +197,7 @@ jobs:
                   }
 
                   val tileH = h / 4f
-                  val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
+                  val minValidRun = (tileH * 0.46f).toInt().coerceIn(55, 72)
                   val sliderRun = (tileH * 0.95f).toInt().coerceIn(145, 162)
                   var anyNewHit = false
                   var anySliderCleared = false
@@ -212,10 +214,15 @@ jobs:
                           svc.enqueueHold(l, holdMs)
                           anyNewHit = true
                       } else if (run >= minValidRun) {
+                          if (tapsThisFrame == 0) {
+                              val dt = now - lastTapHitTime
+                              if (dt in 125L..400L) {
+                                  beatMs = (beatMs * 0.65f + dt * 0.35f).coerceIn(140f, 340f)
+                              }
+                              lastTapHitTime = now
+                          }
                           state[l] = S.TAPPED
                           t0[l] = now
-                          // If a 2nd chord tap is queued on the same frame, it will fire 28ms later (on the next 60fps frame),
-                          // so aim 2.5% lower to track the tile's downward movement during those 28ms!
                           val yFrac = if (tapsThisFrame > 0) (Config.triggerFrac + 0.025f).coerceAtMost(0.82f) else Config.triggerFrac
                           tapsThisFrame++
                           FlightLog.log("DET", "L$l HIT -> TAP (run=$run)")
@@ -223,6 +230,8 @@ jobs:
                           anyNewHit = true
                       }
                   }
+
+                  val maxTapLockMs = (beatMs * 0.68f).toLong().coerceIn(95L, 210L)
 
                   // Pass 1: Check primary trigger line across all 4 lanes
                   for (l in 0 until Config.LANES) {
@@ -239,13 +248,15 @@ jobs:
                               }
                           }
                           S.TAPPED -> {
-                              // Because dark() returns false on faded tapped tiles (R>=52) and on the silver bevel border
-                              // between stacked same-column tiles, hasLightGapAtTrigger immediately detects clearance!
-                              if (now - t0[l] >= 20L && hasLightGapAtTrigger(l)) {
+                              val elapsed = now - t0[l]
+                              if (elapsed >= 20L && hasLightGapAtTrigger(l)) {
                                   state[l] = S.IDLE
-                                  cooldownUntil[l] = now + 8L
-                              } else if (now - t0[l] >= 380L) {
+                                  cooldownUntil[l] = now + 6L
+                              } else if (elapsed >= maxTapLockMs) {
                                   state[l] = S.IDLE
+                                  if (isDarkAtTrig && laneDark(l, trigY - 8) && !laneIsSliderBlue(l, trigY)) {
+                                      triggerLane(l, trigY)
+                                  }
                               }
                           }
                           S.HOLD -> {
@@ -551,9 +562,6 @@ jobs:
                   }
 
                   if (!first.isHold) {
-                      // Dispatch ONE short tap (18ms) per GestureDescription, then wait 10ms in onCompleted before dispatching
-                      // the next queued chord tap (total 28ms start-to-start > 16.67ms VSYNC frame).
-                      // This guarantees every chord tile is a primary 1-finger tap on its own distinct 60fps game frame!
                       val a = queue.poll() ?: return
                       val x = Config.screenW * Config.laneFractions[a.lane]
                       val y = Config.screenH * a.yFrac
@@ -610,8 +618,6 @@ jobs:
                           holdInFlight = false
                           activeHoldMask = 0
                           if (!hasHold && !queue.isEmpty()) {
-                              // Keep tapInFlight = true for 10ms so the game renders 1 frame with fingers UP
-                              // before the 2nd chord tap touches down at t = 28ms!
                               mainHandler.postDelayed({
                                   if (myId == activeGestureId) {
                                       tapInFlight = false
