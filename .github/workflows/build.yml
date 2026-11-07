@@ -29,8 +29,8 @@ jobs:
               @Volatile var darkThreshold = 95
               @Volatile var isPaused = true
 
-              const val TAP_MS = 12L
-              const val MAX_HOLD_MS = 2400L
+              const val TAP_MS = 10L
+              const val HOLD_STEP_MS = 35L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
@@ -68,7 +68,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt
+          # 3. TileDetector.kt - Debounced multi-frame hit detection
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -155,7 +155,8 @@ jobs:
                               }
                           }
                           S.TAPPED -> {
-                              if (!isDark || (now - t0[l] >= 30L)) {
+                              // Prevent machine-gun re-tapping: wait until tile body clears
+                              if (!isDark || (now - t0[l] >= 60L)) {
                                   state[l] = S.IDLE
                               }
                           }
@@ -175,7 +176,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Robust Non-Chunked Gestures
+          # 4. TapService.kt - Unified Multi-Touch Gesture Engine
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -199,6 +200,7 @@ jobs:
           import android.widget.TextView
           import android.widget.Toast
           import java.util.concurrent.ConcurrentLinkedQueue
+          import java.util.concurrent.atomic.AtomicInteger
           import kotlin.math.abs
 
           class TapService : AccessibilityService() {
@@ -207,9 +209,14 @@ jobs:
                   @Volatile var instance: TapService? = null
               }
 
+              private class Action(val lane: Int, val hold: Boolean)
+              private class HoldState(var stroke: StrokeDescription, val x: Float, val y: Float)
+
               private val mainHandler = Handler(Looper.getMainLooper())
-              private val tapQueue = ConcurrentLinkedQueue<Int>()
-              private val activeHoldLanes = HashSet<Int>()
+              private val queue = ConcurrentLinkedQueue<Action>()
+              private val activeHolds = HashMap<Int, HoldState>()
+              private val keep = AtomicInteger(0)
+              private var inFlight = false
 
               private var wm: WindowManager? = null
               private var overlayContainer: LinearLayout? = null
@@ -348,75 +355,111 @@ jobs:
 
               fun tap(lane: Int) {
                   if (Config.isPaused) return
-                  tapQueue.add(lane)
-                  mainHandler.post { pumpTaps() }
+                  queue.add(Action(lane, false))
+                  mainHandler.post { pump() }
               }
 
               fun press(lane: Int) {
                   if (Config.isPaused) return
-                  mainHandler.post {
-                      if (!activeHoldLanes.contains(lane)) {
-                          activeHoldLanes.add(lane)
-                          val x = Config.screenW * Config.laneFractions[lane]
-                          val y = Config.screenH * Config.triggerFrac
-                          val path = Path().apply {
-                              moveTo(x, y)
-                              lineTo(x, y + 2f)
-                          }
-                          val stroke = StrokeDescription(path, 0L, Config.MAX_HOLD_MS, false)
-                          val gesture = GestureDescription.Builder().addStroke(stroke).build()
-                          FlightLog.log("TOUCH", "L$lane START SOLID HOLD (2.4s)")
-                          dispatchGesture(gesture, object : GestureResultCallback() {
-                              override fun onCompleted(d: GestureDescription?) {
-                                  activeHoldLanes.remove(lane)
-                              }
-                              override fun onCancelled(d: GestureDescription?) {
-                                  activeHoldLanes.remove(lane)
-                              }
-                          }, null)
-                      }
-                  }
+                  keep.updateAndGet { it or (1 shl lane) }
+                  queue.add(Action(lane, true))
+                  mainHandler.post { pump() }
               }
 
               fun release(lane: Int) {
-                  mainHandler.post {
-                      if (activeHoldLanes.remove(lane)) {
-                          // Tap a 1ms touch outside active hit area or lift gesture
-                          FlightLog.log("TOUCH", "L$lane RELEASE HOLD")
-                      }
-                  }
+                  keep.updateAndGet { it and (1 shl lane).inv() }
+                  mainHandler.post { pump() }
               }
 
               fun releaseAll() {
-                  mainHandler.post {
-                      activeHoldLanes.clear()
-                      tapQueue.clear()
+                  keep.set(0)
+                  queue.clear()
+                  mainHandler.post { pump() }
+              }
+
+              // True stationary point: same start and end coordinates so Android never drops continuity
+              private fun holdPath(x: Float, y: Float): Path {
+                  return Path().apply {
+                      moveTo(x, y)
+                      lineTo(x, y)
                   }
               }
 
-              private fun pumpTaps() {
-                  if (Config.isPaused) return
-                  val builder = GestureDescription.Builder()
-                  var count = 0
-                  var offset = 0L
-
-                  while (true) {
-                      val lane = tapQueue.poll() ?: break
-                      val x = Config.screenW * Config.laneFractions[lane]
-                      val y = Config.screenH * Config.triggerFrac
-                      val path = Path().apply {
-                          moveTo(x, y)
-                          lineTo(x, y + 2f)
-                      }
-                      builder.addStroke(StrokeDescription(path, offset, Config.TAP_MS, false))
-                      FlightLog.log("TOUCH", "L$lane TAP DISPATCH (offset=${offset}ms)")
-                      count++
-                      offset += 2L
-                      if (count >= 4) break
+              private fun pump() {
+                  if (inFlight) return
+                  if (Config.isPaused) {
+                      activeHolds.clear()
+                      return
                   }
 
-                  if (count > 0) {
-                      dispatchGesture(builder.build(), null, null)
+                  val strokes = ArrayList<StrokeDescription>()
+                  val used = HashSet<Int>()
+                  val mask = keep.get()
+
+                  // 1. Maintain active holds using exact matching coordinates
+                  val it = activeHolds.entries.iterator()
+                  while (it.hasNext()) {
+                      val e = it.next()
+                      val h = e.value
+                      val k = (mask and (1 shl e.key)) != 0
+                      if (k) {
+                          h.stroke = h.stroke.continueStroke(
+                              holdPath(h.x, h.y), 0L, Config.HOLD_STEP_MS, true
+                          )
+                          strokes.add(h.stroke)
+                          used.add(e.key)
+                      } else {
+                          FlightLog.log("TOUCH", "L${e.key} hold finished naturally")
+                          it.remove()
+                      }
+                  }
+
+                  // 2. Consume queued taps & newly initiated holds within the SAME gesture description
+                  var stagger = 0L
+                  while (true) {
+                      val a = queue.poll() ?: break
+                      if (a.lane in used) continue
+                      val x = Config.screenW * Config.laneFractions[a.lane]
+                      val y = Config.screenH * Config.triggerFrac
+                      val p = holdPath(x, y)
+                      if (a.hold) {
+                          val s = StrokeDescription(p, 0L, Config.HOLD_STEP_MS, true)
+                          activeHolds[a.lane] = HoldState(s, x, y)
+                          strokes.add(s)
+                          FlightLog.log("TOUCH", "L${a.lane} initiated HOLD")
+                      } else {
+                          strokes.add(StrokeDescription(p, stagger, Config.TAP_MS, false))
+                          FlightLog.log("TOUCH", "L${a.lane} initiated TAP (offset=${stagger}ms)")
+                          stagger += 2L
+                      }
+                      used.add(a.lane)
+                  }
+
+                  if (strokes.isEmpty()) return
+
+                  val g = GestureDescription.Builder().apply {
+                      strokes.forEach { addStroke(it) }
+                  }.build()
+
+                  inFlight = true
+                  val sent = dispatchGesture(g, object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) {
+                          inFlight = false
+                          pump()
+                      }
+                      override fun onCancelled(d: GestureDescription?) {
+                          FlightLog.log("WARN", "Gesture CANCELLED by OS")
+                          inFlight = false
+                          activeHolds.clear()
+                          pump()
+                      }
+                  }, null)
+
+                  if (!sent) {
+                      FlightLog.log("ERROR", "dispatchGesture returned FALSE")
+                      inFlight = false
+                      activeHolds.clear()
+                      mainHandler.postDelayed({ pump() }, 10L)
                   }
               }
           }
