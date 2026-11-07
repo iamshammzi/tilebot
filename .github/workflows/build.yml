@@ -1,4 +1,5 @@
-name: Build APK
+
+ name: Build APK
 
 on:
   workflow_dispatch:
@@ -32,7 +33,8 @@ jobs:
 
               @Volatile var triggerFrac = 0.65f
               @Volatile var darkThreshold = 95
-              @Volatile var holdDurationMs = 4500L
+              // 20-second ceiling: holds any slider (even 7s-15s finale sliders) until the next tile preempts it
+              @Volatile var holdDurationMs = 20000L
               @Volatile var isPaused = true
 
               const val TAP_MS = 12L
@@ -73,7 +75,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Detects short sliders (run=176..181) via 0.95f threshold + Blue RGB check
+          # 3. TileDetector.kt - Detects all short/medium/mega sliders + 20s preemptible hold ceiling
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -134,8 +136,6 @@ jobs:
                       return c >= 2
                   }
 
-                  // Checks if the upper body of the tile has the royal-blue / cyan color of a slider
-                  // (Black tiles have R~15, G~15, B~25; Blue sliders have R<40, B>95, B-R>40)
                   fun isBlueSliderBody(l: Int, startY: Int, run: Int): Boolean {
                       if (run < 95) return false
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -173,7 +173,6 @@ jobs:
 
                   val tileH = h / 4f
                   val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
-                  // Short black tiles are run=124..135; short blue sliders are run=170..185
                   val sliderRun = (tileH * 0.95f).toInt().coerceIn(145, 162)
                   var anyNewHit = false
 
@@ -252,7 +251,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Atomic multi-finger batching + preemptible 4500ms holds
+          # 4. TapService.kt - Atomic multi-finger batching + preemptible 20,000ms holds
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -477,12 +476,13 @@ jobs:
                           if (a.isHold) lineTo(x, y + 4f) else lineTo(x, y)
                       }
 
-                      strokes.add(StrokeDescription(p, stagger, a.durationMs, false))
+                      val safeDuration = a.durationMs.coerceIn(10L, 55000L)
+                      strokes.add(StrokeDescription(p, stagger, safeDuration, false))
                       if (a.isHold) {
                           hasHold = true
-                          FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${a.durationMs}ms)")
+                          FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${safeDuration}ms)")
                       } else {
-                          FlightLog.log("TOUCH", "L${a.lane} TAP (${a.durationMs}ms, offset=${stagger}ms)")
+                          FlightLog.log("TOUCH", "L${a.lane} TAP (${safeDuration}ms, offset=${stagger}ms)")
                       }
                       stagger += 2L
                       used.add(a.lane)
@@ -574,7 +574,8 @@ jobs:
                   super.onCreate(savedInstanceState)
                   Config.triggerFrac = prefs.getInt("trig", 65) / 100f
                   Config.darkThreshold = prefs.getInt("dark", 95)
-                  Config.holdDurationMs = prefs.getInt("slider_hold_v5", 4500).toLong()
+                  // New key "slider_hold_v6" sets default to 20,000ms (20 seconds)
+                  Config.holdDurationMs = prefs.getInt("slider_hold_v6", 20000).toLong()
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
@@ -604,8 +605,8 @@ jobs:
                   slider(root, "Dark threshold (Default 95)", 40, 150, Config.darkThreshold) {
                       Config.darkThreshold = it; prefs.edit().putInt("dark", it).apply()
                   }
-                  slider(root, "Max slider hold ms (Default 4500)", 1500, 6000, Config.holdDurationMs.toInt()) {
-                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("slider_hold_v5", it).apply()
+                  slider(root, "Max slider hold ms (Default 20000)", 5000, 30000, Config.holdDurationMs.toInt()) {
+                      Config.holdDurationMs = it.toLong(); prefs.edit().putInt("slider_hold_v6", it).apply()
                   }
                   setContentView(root)
               }
