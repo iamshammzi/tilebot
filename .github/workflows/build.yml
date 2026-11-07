@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Live tempo tracking (0.68 * beatMs unlock) + minValidRun=58 + early slider release
+          # 3. TileDetector.kt - Full hold through trigY+4 on normal sliders (+40 score) + early release ONLY on flush same-column tiles
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -117,7 +117,8 @@ jobs:
                   val h = img.height
                   val laneW = w / Config.LANES
                   val trigY = (h * Config.triggerFrac).toInt().coerceIn(28, h - 20)
-                  val releaseY = (trigY - 18).coerceAtLeast(10)
+                  val flushReleaseY = (trigY - 12).coerceAtLeast(10)
+                  val fullTailY = (trigY + 4).coerceAtMost(h - 6)
                   val rThr = Config.darkThreshold.coerceIn(38, 75)
 
                   fun dark(x: Int, y: Int): Boolean {
@@ -161,6 +162,25 @@ jobs:
                       return blue1 && blue2
                   }
 
+                  // True ONLY on the pitch-black bottom of a new tile/slider (away from the center cyan circle)
+                  fun laneIsPitchBlackBottom(l: Int, y: Int): Boolean {
+                      val cy = y.coerceIn(0, h - 1)
+                      val cx = (w * Config.laneFractions[l]).toInt()
+                      val d = (laneW / 4).coerceAtLeast(4)
+                      val o1 = cy * rs + (cx - d) * ps
+                      val o2 = cy * rs + (cx + d) * ps
+                      if (o2 + 2 >= buf.limit() || o1 < 0) return false
+                      val r1 = buf.get(o1).toInt() and 255
+                      val g1 = buf.get(o1 + 1).toInt() and 255
+                      val b1 = buf.get(o1 + 2).toInt() and 255
+                      val r2 = buf.get(o2).toInt() and 255
+                      val g2 = buf.get(o2 + 1).toInt() and 255
+                      val b2 = buf.get(o2 + 2).toInt() and 255
+                      val blk1 = r1 < rThr && g1 < 62 && b1 < 100
+                      val blk2 = r2 < rThr && g2 < 62 && b2 < 100
+                      return blk1 && blk2
+                  }
+
                   fun hasLightGapAtTrigger(l: Int): Boolean {
                       for (y in (trigY - 12)..(trigY + 8)) {
                           if (!laneDark(l, y)) return true
@@ -183,7 +203,7 @@ jobs:
                           if (laneDark(l, y)) {
                               if (laneIsSliderBlue(l, y)) {
                                   seenBlue = true
-                              } else if (seenBlue && !laneIsSliderBlue(l, y) && !laneIsSliderBlue(l, (y - 3).coerceAtLeast(0))) {
+                              } else if (seenBlue && laneIsPitchBlackBottom(l, y) && laneIsPitchBlackBottom(l, (y - 3).coerceAtLeast(0))) {
                                   break
                               }
                               top = y
@@ -211,7 +231,8 @@ jobs:
                           seenBlueInHold[l] = false
                           val holdMs = Config.holdDurationMs
                           FlightLog.log("DET", "L$l HIT -> SLIDER (run=$run, hold=${holdMs}ms)")
-                          svc.enqueueHold(l, holdMs)
+                          // Touch slightly higher (triggerFrac - 0.015f) to catch the slider's bottom circle immediately
+                          svc.enqueueHold(l, holdMs, (Config.triggerFrac - 0.015f).coerceAtLeast(0.45f))
                           anyNewHit = true
                       } else if (run >= minValidRun) {
                           if (tapsThisFrame == 0) {
@@ -260,20 +281,27 @@ jobs:
                               }
                           }
                           S.HOLD -> {
-                              if (!seenBlueInHold[l] && (laneIsSliderBlue(l, releaseY) || laneIsSliderBlue(l, trigY))) {
+                              if (!seenBlueInHold[l] && (laneIsSliderBlue(l, flushReleaseY) || laneIsSliderBlue(l, trigY))) {
                                   seenBlueInHold[l] = true
                               }
-                              val blueEndedAtReleaseLine = seenBlueInHold[l] &&
-                                  (now - t0[l] >= 90L) &&
-                                  !laneIsSliderBlue(l, releaseY) &&
-                                  !laneIsSliderBlue(l, releaseY - 3)
+                              // Case A (Flush same-column tile stacked directly on top of this slider):
+                              // Release early at flushReleaseY (trigY - 12) ONLY if a pitch-black bottom of a 2nd tile is detected!
+                              val flushBlackAbove = seenBlueInHold[l] &&
+                                  (now - t0[l] >= 100L) &&
+                                  laneIsPitchBlackBottom(l, flushReleaseY) &&
+                                  laneIsPitchBlackBottom(l, flushReleaseY - 3)
 
-                              val lightCleared = (now - t0[l] >= 40L) && (!laneDark(l, releaseY) && !laneDark(l, releaseY - 2))
+                              // Case B (Normal slider followed by empty background — 98% of sliders):
+                              // Keep holding all the way until the slider's top edge passes fullTailY (trigY + 4)
+                              // so the cyan bar 100% bursts the white completion dot for the maximum +40 score!
+                              val normalTailCleared = (now - t0[l] >= 60L) &&
+                                  !laneDark(l, trigY) &&
+                                  !laneDark(l, fullTailY)
 
-                              if (blueEndedAtReleaseLine || lightCleared) {
-                                  FlightLog.log("DET", "L$l SLIDER CLEARED")
+                              if (flushBlackAbove || normalTailCleared) {
+                                  FlightLog.log("DET", "L$l SLIDER CLEARED${if (flushBlackAbove) " (FLUSH)" else ""}")
                                   state[l] = S.IDLE
-                                  cooldownUntil[l] = now + 12L
+                                  cooldownUntil[l] = now + 10L
                                   anySliderCleared = true
                               }
                           }
@@ -301,7 +329,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Frame-separated 1-finger chord taps (18ms tap + 10ms gap = 28ms next-VSYNC-frame guarantee)
+          # 4. TapService.kt - Frame-separated 1-finger chord taps + full-score slider holds
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
