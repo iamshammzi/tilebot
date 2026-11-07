@@ -30,7 +30,7 @@ jobs:
               @Volatile var isPaused = true
 
               const val TAP_MS = 8L
-              const val BURST_INTERVAL_MS = 16L   // Re-tap frequency during long sliders
+              const val BURST_INTERVAL_MS = 16L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
@@ -68,7 +68,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Rapid Burst Slider Automation
+          # 3. TileDetector.kt
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -165,7 +165,6 @@ jobs:
                               val above = laneDark(l, trigY - 2) || laneDark(l, trigY - 4)
                               if (above) {
                                   holdMiss[l] = 0
-                                  // Fire continuous rapid burst taps while tile passes through
                                   if (now - lastBurstTime[l] >= Config.BURST_INTERVAL_MS) {
                                       lastBurstTime[l] = now
                                       svc.tap(l)
@@ -181,7 +180,7 @@ jobs:
           }
           EOF
 
-          # 4. TapService.kt - Pure Non-Blocking Tap Queue (Zero OS Hold Cancellations)
+          # 4. TapService.kt
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -355,6 +354,10 @@ jobs:
                   if (Config.isPaused) return
                   tapQueue.add(lane)
                   mainHandler.post { pump() }
+              }
+
+              fun releaseAll() {
+                  tapQueue.clear()
               }
 
               private fun pump() {
