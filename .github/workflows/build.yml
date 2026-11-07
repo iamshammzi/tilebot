@@ -35,7 +35,7 @@ jobs:
               @Volatile var holdDurationMs = 20000L
               @Volatile var isPaused = true
 
-              const val TAP_MS = 16L
+              const val TAP_MS = 18L
 
               @Volatile var screenW = 0
               @Volatile var screenH = 0
@@ -73,7 +73,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Detects both light gaps AND flush Blue->Black same-column boundaries
+          # 3. TileDetector.kt - Active hold release on SLIDER CLEARED + flush Blue->Black same-column detection
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -136,7 +136,6 @@ jobs:
                       return c >= 2
                   }
 
-                  // Checks if the row y in lane l is inside the bright blue / cyan body of a slider (B > 130, B - R > 55)
                   fun laneIsSliderBlue(l: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -154,8 +153,6 @@ jobs:
                       return blueCount >= 2
                   }
 
-                  // Checks if the row y in lane l is the pitch-black bottom of a new tile (R < 45, G < 58, B < 88)
-                  // Every black tap tile AND the bottom start-circle area of every new blue slider is pitch black!
                   fun laneIsPitchBlack(l: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -192,7 +189,6 @@ jobs:
                       return laneIsSliderBlue(l, sampleY)
                   }
 
-                  // Stops at either a 2px light gap OR a Blue->PitchBlack boundary so flush same-column tiles never merge
                   fun runLengthFrom(l: Int, startY: Int): Int {
                       var y = startY
                       var top = startY
@@ -203,7 +199,6 @@ jobs:
                               if (laneIsSliderBlue(l, y)) {
                                   seenBlue = true
                               } else if (seenBlue && laneIsPitchBlack(l, y) && laneIsPitchBlack(l, y - 2)) {
-                                  // Reached the pitch-black bottom of a second tile stacked flush on top of this slider
                                   break
                               }
                               top = y
@@ -220,6 +215,7 @@ jobs:
                   val minValidRun = (tileH * 0.42f).toInt().coerceAtLeast(35)
                   val sliderRun = (tileH * 0.95f).toInt().coerceIn(145, 162)
                   var anyNewHit = false
+                  var anySliderCleared = false
 
                   fun triggerLane(l: Int, scanY: Int) {
                       val run = runLengthFrom(l, scanY)
@@ -254,7 +250,7 @@ jobs:
                               if (now - t0[l] >= 25L && hasLightGapAtTrigger(l)) {
                                   state[l] = S.IDLE
                                   cooldownUntil[l] = now + 10L
-                              } else if (now - t0[l] >= 320L) {
+                              } else if (now - t0[l] >= 300L) {
                                   state[l] = S.IDLE
                               }
                           }
@@ -263,17 +259,16 @@ jobs:
                                   seenBlueInHold[l] = true
                               }
                               val lightCleared = now - t0[l] >= 40L && hasLightGapAtTrigger(l)
-                              // Flush same-column boundary: Slider #1's blue body just ended and Tile #2's pitch-black bottom arrived at trigY!
                               val flushNextTileArrived = seenBlueInHold[l] &&
-                                  (now - t0[l] >= 120L) &&
+                                  (now - t0[l] >= 110L) &&
                                   laneIsPitchBlack(l, trigY) &&
                                   laneIsPitchBlack(l, trigY - 4)
 
                               if (lightCleared || flushNextTileArrived) {
                                   FlightLog.log("DET", "L$l SLIDER CLEARED${if (flushNextTileArrived) " (FLUSH NEXT)" else ""}")
                                   state[l] = S.IDLE
+                                  anySliderCleared = true
                                   if (flushNextTileArrived) {
-                                      // Immediately trigger the flush follow-up tile in the same column on this frame!
                                       triggerLane(l, trigY)
                                   } else {
                                       cooldownUntil[l] = now + 12L
@@ -294,12 +289,16 @@ jobs:
                           }
                       }
                       svc.commitFrame()
+                  } else if (anySliderCleared && state.none { it == S.HOLD }) {
+                      // Actively release the 20,000ms hold the exact millisecond the slider finishes,
+                      // so the touchscreen is 100% idle before the next tile or chord arrives!
+                      svc.releaseHoldNow()
                   }
               }
           }
           EOF
 
-          # 4. TapService.kt - Non-overlapping sequential chord strokes in one GestureDescription
+          # 4. TapService.kt - Active hold release via overlay sink + simultaneous 18ms multi-touch chords
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TapService.kt
           package com.example.tilebot
 
@@ -317,6 +316,7 @@ jobs:
           import android.os.Looper
           import android.view.Gravity
           import android.view.MotionEvent
+          import android.view.View
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
           import android.widget.LinearLayout
@@ -344,6 +344,7 @@ jobs:
               private var wm: WindowManager? = null
               private var overlayContainer: LinearLayout? = null
               private var btnToggle: TextView? = null
+              private var touchSinkView: View? = null
 
               override fun onServiceConnected() {
                   instance = this
@@ -407,9 +408,13 @@ jobs:
                       }
                   }
 
-                  val spacer = android.view.View(this).apply {
-                      layoutParams = LinearLayout.LayoutParams(12, 1)
+                  // Inert touch-sink spacer inside our overlay: a 1ms touch here cancels any active 20,000ms hold
+                  // while being 100% absorbed by our overlay window so the game never sees it!
+                  val spacer = View(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(24, 36)
+                      setOnTouchListener { _, _ -> true }
                   }
+                  touchSinkView = spacer
 
                   container.addView(toggle)
                   container.addView(spacer)
@@ -474,6 +479,7 @@ jobs:
                   }
                   overlayContainer = null
                   btnToggle = null
+                  touchSinkView = null
               }
 
               fun enqueueTap(lane: Int) {
@@ -489,6 +495,41 @@ jobs:
               fun commitFrame() {
                   if (Config.isPaused) return
                   mainHandler.post { pump() }
+              }
+
+              fun releaseHoldNow() {
+                  if (Config.isPaused) return
+                  mainHandler.post {
+                      if (!holdInFlight || !queue.isEmpty()) return@post
+                      val sink = touchSinkView
+                      val loc = IntArray(2)
+                      if (sink != null) {
+                          sink.getLocationOnScreen(loc)
+                      }
+                      val rx = if (loc[0] > 0) loc[0] + sink!!.width / 2f else 140f
+                      val ry = if (loc[1] > 0) loc[1] + sink!!.height / 2f else 95f
+                      val p = Path().apply {
+                          moveTo(rx, ry)
+                          lineTo(rx, ry)
+                      }
+                      val g = GestureDescription.Builder()
+                          .addStroke(StrokeDescription(p, 0L, 1L, false))
+                          .build()
+                      val myId = ++activeGestureId
+                      holdInFlight = false
+                      tapInFlight = false
+                      activeHoldMask = 0
+                      dispatchGesture(g, object : GestureResultCallback() {
+                          override fun onCompleted(d: GestureDescription?) {
+                              if (myId != activeGestureId) return
+                              pump()
+                          }
+                          override fun onCancelled(d: GestureDescription?) {
+                              if (myId != activeGestureId) return
+                              pump()
+                          }
+                      }, null)
+                  }
               }
 
               fun releaseAll() {
@@ -515,58 +556,36 @@ jobs:
                   var hasHold = false
                   var newHoldMask = 0
 
-                  // Whenever preempting an active slider hold, leave a 12ms finger-up gap at 0..12ms
-                  // so the game cleanly processes ACTION_UP on the finished slider before the new ACTION_DOWN!
+                  // If an active hold is still in flight (e.g. a flush same-column tile arrived on the same frame as SLIDER CLEARED),
+                  // add a 10ms startTime gap so ACTION_UP from the finished slider is processed before the new ACTION_DOWN!
                   if (holdInFlight) {
-                      stagger = 12L
+                      stagger = 10L
                   }
 
-                  if (!first.isHold) {
-                      // Bundle chord taps into ONE GestureDescription with NON-OVERLAPPING time windows:
-                      // Tap 1: stagger .. stagger+16ms -> 6ms gap -> Tap 2: stagger+22ms .. stagger+38ms.
-                      // Because Tap 1 lifts up before Tap 2 touches down, both taps are primary 1-finger ACTION_DOWN events
-                      // spanning a full 60fps frame (16ms), delivered in a single atomic dispatchGesture call!
-                      while (true) {
-                          val a = queue.peek() ?: break
-                          if (a.isHold) break
-                          if (a.lane in used) break
-                          queue.poll()
+                  while (true) {
+                      val a = queue.peek() ?: break
+                      if (a.lane in used) break
+                      if (strokes.isNotEmpty() && (a.isHold != hasHold)) break
+                      queue.poll()
 
-                          val x = Config.screenW * Config.laneFractions[a.lane]
-                          val y = Config.screenH * Config.triggerFrac
-                          val p = Path().apply {
-                              moveTo(x, y)
-                              lineTo(x, y)
-                          }
-                          val tapDur = a.durationMs.coerceIn(14L, 20L)
-                          strokes.add(StrokeDescription(p, stagger, tapDur, false))
-                          FlightLog.log("TOUCH", "L${a.lane} TAP (${tapDur}ms, offset=${stagger}ms)")
-                          // Advance stagger past the end of this tap + 6ms finger-up gap so the next chord tap is also a primary pointer
-                          stagger += tapDur + 6L
-                          used.add(a.lane)
+                      val x = Config.screenW * Config.laneFractions[a.lane]
+                      val y = Config.screenH * Config.triggerFrac
+                      val p = Path().apply {
+                          moveTo(x, y)
+                          if (a.isHold) lineTo(x, y + 4f) else lineTo(x, y)
                       }
-                  } else {
-                      // Bundle simultaneous double-sliders (isHold == true) so both sliders hold together
-                      while (true) {
-                          val a = queue.peek() ?: break
-                          if (!a.isHold) break
-                          if (a.lane in used) break
-                          queue.poll()
 
-                          val x = Config.screenW * Config.laneFractions[a.lane]
-                          val y = Config.screenH * Config.triggerFrac
-                          val p = Path().apply {
-                              moveTo(x, y)
-                              lineTo(x, y + 4f)
-                          }
-                          val safeDuration = a.durationMs.coerceIn(10L, 55000L)
-                          strokes.add(StrokeDescription(p, stagger, safeDuration, false))
+                      val safeDuration = if (a.isHold) a.durationMs.coerceIn(10L, 55000L) else a.durationMs.coerceIn(14L, 22L)
+                      strokes.add(StrokeDescription(p, stagger, safeDuration, false))
+                      if (a.isHold) {
                           hasHold = true
                           newHoldMask = newHoldMask or (1 shl a.lane)
                           FlightLog.log("TOUCH", "L${a.lane} FULL HOLD (${safeDuration}ms, offset=${stagger}ms)")
-                          stagger += 2L
-                          used.add(a.lane)
+                      } else {
+                          FlightLog.log("TOUCH", "L${a.lane} TAP (${safeDuration}ms, offset=${stagger}ms)")
                       }
+                      stagger += 2L
+                      used.add(a.lane)
                   }
 
                   if (strokes.isEmpty()) return
