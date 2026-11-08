@@ -72,7 +72,7 @@ jobs:
           }
           EOF
 
-          # 3. TileDetector.kt - Dead-zone-free (laneDark && !laneIsSliderBlue) same-column flush detection
+          # 3. TileDetector.kt - Requires hasBlueSliderBody for sliders so stacked black tiles (run=130) are ALWAYS tapped!
           cat << 'EOF' > TileBot/app/src/main/java/com/example/tilebot/TileDetector.kt
           package com.example.tilebot
 
@@ -89,7 +89,7 @@ jobs:
               private val seenBlueInHold = BooleanArray(Config.LANES)
 
               private var lastTapHitTime = 0L
-              private var beatMs = 220f
+              private var beatMs = 200f
               private var lastFrameTime = 0L
               private var prioritySet = false
               private var playfieldActiveSince = 0L
@@ -102,7 +102,7 @@ jobs:
                       seenBlueInHold[i] = false
                   }
                   lastTapHitTime = 0L
-                  beatMs = 220f
+                  beatMs = 200f
                   playfieldActiveSince = 0L
                   hadFirstHitInMatch = false
               }
@@ -187,8 +187,6 @@ jobs:
                       return c >= 2
                   }
 
-                  // True inside the royal-blue or bright-cyan upper 80% of a slider (away from the center circle);
-                  // False on short black tiles AND on the dark-black bottom 20% of a new slider!
                   fun laneIsSliderBlue(l: Int, y: Int): Boolean {
                       val cy = y.coerceIn(0, h - 1)
                       val cx = (w * Config.laneFractions[l]).toInt()
@@ -207,21 +205,23 @@ jobs:
                       return blue1 && blue2
                   }
 
-                  fun hasLightGapAtTrigger(l: Int): Boolean {
-                      for (y in (trigY - 6)..(trigY + 4)) {
-                          if (!laneDark(l, y)) return true
+                  // Verifies that the tile actually contains royal-blue / cyan slider body pixels!
+                  // Two stacked black tap tiles in the same column have run ~ 130, but 0 blue rows -> returns FALSE!
+                  fun hasBlueSliderBody(l: Int, startY: Int, run: Int): Boolean {
+                      if (run < 50) return false
+                      val topScan = (startY - run + 4).coerceAtLeast(2)
+                      val botScan = (startY - 10).coerceAtLeast(topScan)
+                      var blueRows = 0
+                      var y = botScan
+                      while (y >= topScan) {
+                          if (laneIsSliderBlue(l, y)) {
+                              if (++blueRows >= 5) return true
+                          }
+                          y -= 2
                       }
                       return false
                   }
 
-                  fun isBlueSliderBody(l: Int, startY: Int, run: Int): Boolean {
-                      if (run < 45) return false
-                      val sampleY = (startY - (run * 0.55f).toInt()).coerceIn(2, h - 2)
-                      return laneIsSliderBlue(l, sampleY)
-                  }
-
-                  // Dead-zone-free run length scan: once slider blue is seen, if laneDark is still true
-                  // but laneIsSliderBlue becomes false for 2 rows, we hit a flush 2nd tile stacked in the same column!
                   fun runLengthFrom(l: Int, startY: Int): Int {
                       var y = startY
                       var top = startY
@@ -244,16 +244,21 @@ jobs:
                       return startY - top
                   }
 
+                  // At SCALE = 8, h is ~300, 1 black tap tile is ~64px.
+                  // Setting minValidRun = 42 prevents double-tapping a single black tile (run <= 39 after 0.65 * beatMs),
+                  // while guaranteeing a stacked 2nd black tile in the same column (run ~ 64 >= 42) is always tapped!
                   val tileH = h / 4.5f
-                  val minValidRun = (tileH * 0.45f).toInt().coerceIn(26, 38)
-                  val sliderRun = (tileH * 1.15f).toInt().coerceIn(72, 84)
+                  val minValidRun = (tileH * 0.62f).toInt().coerceIn(40, 48)
+                  val minSliderRun = (tileH * 1.10f).toInt().coerceIn(68, 80)
                   var anyNewHit = false
                   var anyFlushSliderRelease = false
                   var tapsThisFrame = 0
 
                   fun triggerLane(l: Int, scanY: Int, customTouchFrac: Float = Config.triggerFrac) {
                       val run = runLengthFrom(l, scanY)
-                      if (run >= sliderRun || isBlueSliderBody(l, scanY, run)) {
+                      // A tile is a SLIDER if and only if it is tall enough AND has a blue slider body!
+                      // Stacked black tiles (run = 130, hasBlueSliderBody = false) will now be tapped as TAPs!
+                      if (run >= minSliderRun && hasBlueSliderBody(l, scanY, run)) {
                           state[l] = S.HOLD
                           t0[l] = now
                           seenBlueInHold[l] = false
@@ -266,7 +271,7 @@ jobs:
                           if (tapsThisFrame == 0) {
                               val dt = now - lastTapHitTime
                               if (dt in 125L..400L) {
-                                  beatMs = (beatMs * 0.65f + dt * 0.35f).coerceIn(140f, 340f)
+                                  beatMs = (beatMs * 0.65f + dt * 0.35f).coerceIn(135f, 320f)
                               }
                               lastTapHitTime = now
                           }
@@ -281,7 +286,7 @@ jobs:
                       }
                   }
 
-                  val maxTapLockMs = (beatMs * 0.68f).toLong().coerceIn(95L, 210L)
+                  val maxTapLockMs = (beatMs * 0.64f).toLong().coerceIn(90L, 175L)
 
                   if (!hadFirstHitInMatch && (now - playfieldActiveSince <= 2500L)) {
                       val lateY = (h * 0.82f).toInt()
@@ -312,10 +317,16 @@ jobs:
                           }
                           S.TAPPED -> {
                               val elapsed = now - t0[l]
-                              if (elapsed >= 20L && hasLightGapAtTrigger(l)) {
+                              // Only check trigY and trigY - 4 (never below trigY!) so empty space below a newly
+                              // entering tile never causes a premature reset at 20ms!
+                              val bodyCleared = elapsed >= 35L && !isDarkAtTrig && !laneDark(l, trigY - 4)
+                              if (bodyCleared) {
                                   state[l] = S.IDLE
-                                  cooldownUntil[l] = now + 6L
+                                  cooldownUntil[l] = now + 8L
                               } else if (elapsed >= maxTapLockMs) {
+                                  // Unlock at 64% of 1 beat: if a 2nd black tile is stacked flush on top of Tile #1
+                                  // in the same column, its remaining run is >= 64px (>= minValidRun=42) -> triggers immediately!
+                                  // If no 2nd tile is stacked, Tile #1 has <= 24px left (< minValidRun=42) -> ignored!
                                   state[l] = S.IDLE
                                   if (isDarkAtTrig && laneDark(l, trigY - 4) && !laneIsSliderBlue(l, trigY)) {
                                       triggerLane(l, trigY)
@@ -326,9 +337,6 @@ jobs:
                               if (!seenBlueInHold[l] && (laneIsSliderBlue(l, flushReleaseY) || laneIsSliderBlue(l, trigY))) {
                                   seenBlueInHold[l] = true
                               }
-                              // Dead-zone-free flush boundary check:
-                              // Once slider blue was seen, if flushReleaseY is STILL dark (laneDark == true)
-                              // but NO LONGER slider blue (!laneIsSliderBlue == true), a flush 2nd tile in the same column is here!
                               val flushBlackAbove = seenBlueInHold[l] &&
                                   (now - t0[l] >= 90L) &&
                                   laneDark(l, flushReleaseY) &&
